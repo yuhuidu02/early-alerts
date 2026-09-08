@@ -13,6 +13,13 @@ Flow:
     3. Read all agent result JSONs from S3
     4. Replace CAT_NEEDS_AGENT rows with resolved categories
     5. Write alerts_TIMESTAMP_final.csv and alerts_TIMESTAMP_final.xlsx to S3
+
+manifest["mode"] == "research":
+    Agent result JSONs additionally carry rationale/category_no_ml/rationale_no_ml/
+    at_risk_predicted/at_risk_probability. The .csv is unaffected (CSV_FIELDS still
+    only has the base 16 columns, extra keys are dropped). The .xlsx gets 5 extra
+    columns via build_xlsx_bytes_research() instead of batch_categorize's
+    build_xlsx_bytes() — blank for rows that were never agent-routed.
 """
 
 import json
@@ -30,7 +37,7 @@ import psycopg2.extras
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
-from batch_categorize import CATEGORY_ORDER, build_xlsx_bytes, CAT_NEEDS_AGENT, CSV_FIELDS
+from batch_categorize import CATEGORY_ORDER, build_xlsx_bytes, CAT_NEEDS_AGENT, CSV_FIELDS, XLSX_HEADERS, COL_WIDTHS
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -67,8 +74,11 @@ def _upload(body: bytes, bucket: str, key: str, content_type: str) -> str:
 # --- Collect agent results ---
 def _collect_agent_results(bucket: str, manifest: dict) -> dict:
     """
-    Returns dict keyed by (canvas_user_id, canvas_course_id) -> resolved category.
-    Reads only the JSON files that exits - skips any that failed/timed out.
+    Returns dict keyed by (canvas_user_id, canvas_course_id) -> full agent result dict.
+    Production result JSONs have just {"category": ...}; research mode result JSONs
+    additionally have rationale/category_no_ml/rationale_no_ml/at_risk_predicted/
+    at_risk_probability — _merge() reads whatever's there via .get().
+    Reads only the JSON files that exist - skips any that failed/timed out.
     """
 
     date_prefix = manifest["date_prefix"]
@@ -78,7 +88,7 @@ def _collect_agent_results(bucket: str, manifest: dict) -> dict:
         key = f"agent_results/{date_prefix}/{job['canvas_user_id']}_{job['canvas_course_id']}.json"
         try:
             result = _read_json(bucket, key)
-            results[(result["canvas_user_id"], result["canvas_course_id"])] = result["category"]
+            results[(result["canvas_user_id"], result["canvas_course_id"])] = result
         except Exception as e:
             # Agent job didn't complete successfully - leave as CAT_NEEDS_AGENT
             logger.warning("Missing agent result: %s", key)
@@ -153,6 +163,9 @@ def _merge(original_rows: list, agent_results: dict) -> list:
     """
     Replaces CAT_NEEDS_AGENT in original_rows with resolved categories from agent_results.
     Rows without agent jobs (i.e., not CAT_NEEDS_AGENT) are left unchanged.
+    In research mode, also attaches rationale/category_no_ml/rationale_no_ml/
+    at_risk_predicted/at_risk_probability from the agent result onto the row
+    (absent -> not set, so downstream .get() calls default to None/blank).
     """
     merged = []
     for row in original_rows:
@@ -162,9 +175,87 @@ def _merge(original_rows: list, agent_results: dict) -> list:
             if resolved:
                 row = dict(row)  # create a copy to avoid mutating original
                 row["category"] = resolved
+                if "rationale" in resolved:
+                    row["rationale"] = resolved.get("rationale")
+                    row["category_no_ml"] = resolved.get("category_no_ml")
+                    row["rationale_no_ml"] = resolved.get("rationale_no_ml")
+                    row["at_risk_predicted"] = resolved.get("at_risk_predicted")
+                    row["at_risk_probability"] = resolved.get("at_risk_probability")
         merged.append(row)
     return merged
 
+# --- Research-mode xlsx builder (5 extra columns beyond batch_categorize's build_xlsx_bytes) ---
+RESEARCH_XLSX_HEADERS = XLSX_HEADERS + [
+    "ML At-Risk Predicted", "ML At-Risk Probability",
+    "Rationale", "Category (No ML)", "Rationale (No ML)",
+]
+RESEARCH_COL_WIDTHS = COL_WIDTHS + [16, 18, 60, 40, 60]
+
+def build_xlsx_bytes_research(records: list) -> bytes:
+    """
+    Single-sheet workbook for one course's records — mirrors batch_categorize's
+    build_xlsx_bytes() row-writing for the first 16 columns, then appends the
+    5 research columns. Blank for any row that was never agent-routed.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+ 
+    ws.append(RESEARCH_XLSX_HEADERS)
+    for cell in ws[1]:
+        cell.font = Font(name="Arial", bold=True)
+        cell.alignment = Alignment(horizontal="center")
+ 
+    sorted_recs = sorted(
+        records,
+        key=lambda r: (
+            CATEGORY_ORDER.index(r["category"]) if r["category"] in CATEGORY_ORDER else 99,
+            r["student_name"],
+        )
+    )
+    for rec in sorted_recs:
+        fired_str = " | ".join(rec.get("fired_rules", []))
+        ws.append([
+            rec["canvas_user_id"],
+            rec["student_name"],
+            rec["nshe_id"],
+            rec["course_name"],
+            rec["canvas_course_id"],
+            rec["section_number"],
+            rec["category"],
+            fired_str,
+            rec.get("current_grade"),
+            rec.get("quiz_score"),
+            rec.get("missing_assignments"),
+            rec.get("total_clicks"),
+            rec.get("click_coverage_z"),
+            rec.get("click_intensity_z"),
+            rec.get("click_coherence_z"),
+            rec.get("last_active"),
+            rec.get("at_risk_predicted"),
+            rec.get("at_risk_probability"),
+            rec.get("rationale"),
+            rec.get("category_no_ml"),
+            rec.get("rationale_no_ml"),
+        ])
+        ri = ws.max_row
+        ws.cell(ri, 9).number_format = "0.0"     # current_grade
+        ws.cell(ri, 10).number_format = "0.0"    # quiz_score
+        ws.cell(ri, 13).number_format = "0.00"   # click_coverage_z
+        ws.cell(ri, 14).number_format = "0.00"   # click_intensity_z
+        ws.cell(ri, 15).number_format = "0.00"   # click_coherence_z
+        ws.cell(ri, 18).number_format = "0.000"  # at_risk_probability
+        for col in (19, 21):  # Rationale, Rationale (No ML) — wrap for readability
+            ws.cell(ri, col).alignment = Alignment(wrap_text=True, vertical="top")
+ 
+    for i, w in enumerate(RESEARCH_COL_WIDTHS, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+ 
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+ 
 # --- Lambda handler ---
 def lambda_handler(event, context):
     manifest_key = event["manifest_key"]
@@ -233,6 +324,12 @@ def lambda_handler(event, context):
             "click_intensity_z":    float(row["click_intensity_z"]) if row.get("click_intensity_z") else None,
             "click_coherence_z":    float(row["click_coherence_z"]) if row.get("click_coherence_z") else None,
             "last_active":         row.get("last_active"),
+            # research-mode-only — absent/None for any row that wasn't agent-routed
+            "at_risk_predicted":   row.get("at_risk_predicted"),
+            "at_risk_probability": row.get("at_risk_probability"),
+            "rationale":           row.get("rationale"),
+            "category_no_ml":      row.get("category_no_ml"),
+            "rationale_no_ml":     row.get("rationale_no_ml"),
         })
 
     # 6. Group records by canvas_course_id
@@ -241,12 +338,14 @@ def lambda_handler(event, context):
         by_course[rec["canvas_course_id"]].append(rec)
 
     # 7. Write one CSV + one XLSX per course
+    mode = manifest.get("mode", "production")
     s3_files = {}
     for canvas_course_id, course_records in by_course.items():
         final_csv_key   = f"{date_prefix}/alerts_{batch_timestamp}_{canvas_course_id}_final.csv"
         final_excel_key = f"{date_prefix}/alerts_{batch_timestamp}_{canvas_course_id}_final.xlsx"
 
-        # CSV
+        # CSV — unaffected by mode: CSV_FIELDS only has the base 16 columns, and
+        # DictWriter(extrasaction="ignore") silently drops the 5 research keys.
         buf = io.StringIO()
         flat = []
         for r in course_records:
@@ -259,8 +358,10 @@ def lambda_handler(event, context):
         csv_bytes = buf.getvalue().encode("utf-8")
 
         s3_csv = _upload(csv_bytes, bucket, final_csv_key, "text/csv")
+        
+        excel_builder = build_xlsx_bytes_research if mode == "research" else build_xlsx_bytes
         s3_excel = _upload(
-            build_xlsx_bytes(course_records), bucket, final_excel_key,
+            excel_builder(course_records), bucket, final_excel_key,
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
         s3_files[canvas_course_id] = {"csv": s3_csv, "excel": s3_excel}

@@ -9,6 +9,11 @@ Categorization logic:
   - If 2+ rules fire        -> flag for agent to decide best category
   - If 0 rules fire         -> Positive (satisfactory or exceptional)
 
+  research_mode=True (see run()/categorize()) additionally flags for the agent any
+  student where the deterministic rules and the ML at-risk prediction disagree
+  (0 rules fired but ML flags at-risk, or exactly 1 rule fired but ML doesn't).
+  Default (research_mode=False) behavior is unchanged from production.
+
 Output written to S3:
   s3://<ALERTS_BUCKET>/alerts/YYYY/MM/DD/alerts_YYYYMMDD_HHMMSS.csv
   s3://<ALERTS_BUCKET>/alerts/YYYY/MM/DD/alerts_YYYYMMDD_HHMMSS.xlsx
@@ -373,15 +378,22 @@ def get_fired_rules(student: dict, click: dict | None, at_risk_flagged: bool = F
 # The three "investigable" negative categories - only these trigger the agent
 INVESTIGABLE = [CAT_MISSING_ASSIGNMENTS, CAT_LOW_ENGAGEMENT, CAT_EXAM_PERFORMANCE]
 
-def categorize(student: dict, click: dict | None, at_risk_flagged: bool = False) -> str:
+def categorize(student: dict, click: dict | None, at_risk_flagged: bool = False, research_mode: bool = False) -> str:
     """
     Returns (final category, all fired rules).
 
-    Agent routing rules:
+    Agent routing rules (research_mode=False, default — production, unchanged)::
       - CAT_NEVER_ATTENDED fires -> always deterministic
       - Both positives fire -> always deterministic
       - 2+ of the investigable negatives -> CAT_NEEDS_AGENT
       - anything else -> deterministic (1 rule fired)
+
+    Additional conflict/ambiguous cases routed to the agent when research_mode=True
+    (rules and the ML at-risk prediction disagree):
+      - 0 investigable rules fired, but ML flagged the student at-risk
+      - exactly 1 investigable rule fired, but ML did NOT flag the student at-risk
+    NEVER_ATTENDED still always takes priority and is never a conflict case, even
+    in research_mode.
     """
 
     fired = get_fired_rules(student, click, at_risk_flagged)
@@ -392,6 +404,8 @@ def categorize(student: dict, click: dict | None, at_risk_flagged: bool = False)
         return CAT_NEVER_ATTENDED, fired
     
     if len(fired) == 0:
+        if research_mode and at_risk_flagged:
+            return CAT_NEEDS_AGENT, fired # ML says at-risk but no deterministic rules fired # added 090826
         category = CAT_POSITIVE_EXCEPTIONAL if grade >= 85.0 else CAT_POSITIVE_SATISFACTORY
         return category, fired
     
@@ -400,6 +414,9 @@ def categorize(student: dict, click: dict | None, at_risk_flagged: bool = False)
 
     if len(investigable_fired) >= 2:
         return CAT_NEEDS_AGENT, fired
+    
+    if research_mode and len(investigable_fired) == 1 and not at_risk_flagged:
+        return CAT_NEEDS_AGENT, fired  # ML says not at-risk but 1 deterministic rule fired # added 090826
     
     # exactly one investigable rule fired -> deterministic category
     return fired[0], fired
@@ -518,7 +535,8 @@ def run(
     timescale_cfg: dict,
     canvas_course_ids: list,
     s3_bucket: str,
-    as_of_date: str # e.g., "2026-03-12"
+    as_of_date: str,  # e.g., "2026-03-12"
+    research_mode: bool = False
 ) -> dict:
     """
     Returns:
@@ -526,10 +544,17 @@ def run(
         "total": 123,
         "needs_agent": 45,
         "by_category": { ... },
-        "agent_queue": [ { canvas_user_id, canvas_course_id, fired_rules }, ... ],
+        "agent_queue": [ { canvas_user_id, canvas_course_id, fired_rules  fired_rules_no_ml (research_mode only), at_risk_predicted, at_risk_probability }, ... ],
         "s3_csv": "s3://...",
-        "s3_excel": "s3://..."
+        "s3_excel": "s3://...",
+        "research_mode": false,
     }
+
+    research_mode=False (default) is byte-identical to today's production behavior.
+    research_mode=True widens agent-routing (see categorize()) to include conflict/
+    ambiguous cases where the deterministic rules and the ML at-risk prediction
+    disagree, and attaches each queued student's ML prediction to their agent_queue
+    entry so attribution_handler.py doesn't need to re-fetch it.
     """
     now = datetime.utcnow()
     ts = now.strftime("%Y%m%d_%H%M%S")
@@ -568,13 +593,22 @@ def run(
         records.append(record)
 
         if category == CAT_NEEDS_AGENT:
-            agent_queue.append({
+            entry ={
                 "canvas_user_id": student["canvas_user_id"],
                 "canvas_course_id": student["canvas_course_id"],
                 "student_name": student["name"],
                 "course_name": student["course_name"],
                 "fired_rules": fired,
-            })
+                "at_risk_predicted": prediction["at_risk_predicted"] if prediction else None,
+                "at_risk_probability": prediction["at_risk_probability"] if prediction else None,
+            }
+            if research_mode:
+                # Recompute with thresholds forced to "default" (unadjusted) — the AI-only
+                # condition must never see a fired_rules list that was itself already
+                # influenced by the ML flag via THRESHOLDS["flagged"]. Only relevant when
+                # at_risk_flagged was actually True; otherwise this is identical to `fired`
+                entry["fired_rules_no_ml"] = get_fired_rules(student, click, at_risk_flagged=False)
+            agent_queue.append(entry)
 
     counts = Counter(r["category"] for r in records)
     logger.info("--- Summary: %d students ---", len(records))
@@ -596,5 +630,6 @@ def run(
         "date_prefix": prefix,
         "s3_csv": s3_csv,
         "s3_excel": s3_excel,
+        "research_mode": research_mode,
     }
 

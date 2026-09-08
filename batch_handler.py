@@ -10,6 +10,13 @@ Flow (CHIRON_MODE="production", the default):
 4. Fan out one async attribution_handler invocation per queued student
 5. EventBridge triggers merge_handler as a safety net after a fixed delay
 
+CHIRON_MODE env var ("production", the default, or "research"):
+  Toggles batch_categorize.run(research_mode=...) — in research mode, more students
+  are queued for the agent (conflict/ambiguous cases where rules and ML disagree,
+  not just the classic 2+-rules case), the manifest/attribution payload carry a
+  "mode": "research" flag and fired_rules_no_ml, and attribution_handler.py /
+  merge_handler.py branch on that flag. No new Lambda — same 3 functions either way.
+
 Triggered by:
  - EventBridge on a fixed schedule (e.g., every Sunday at 2am)
  - Direct invoke / POST / batch with optional { "canvas_course_ids": [...]}
@@ -25,6 +32,8 @@ import psycopg2
 import psycopg2.extras
 
 import batch_categorize
+
+CHIRON_MODE = os.environ.get("CHIRON_MODE", "production")
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -65,19 +74,22 @@ def _write_manifest(
         excel_key: str,
         agent_queue: list,
         as_of_date: str,
-        run_id: str = None
+        run_id: str = None,
+        mode: str = CHIRON_MODE
 ) -> str:
     """
     Writes a manifest.json to S3 that tracks:
      - the original CSV/Excel keys (for merge to find them)
      - every agent job that needs to complete
      - total count (for merge to know when done)
+     - mode ("production"/"research") so merge_handler.py knows how to build output
     """
     manifest = {
         "batch_timestamp": batch_timestamp,
         "date_prefix": date_prefix,
         "as_of_date": as_of_date,
         "run_id": run_id,
+        "mode": mode,
         "csv_key": csv_key,
         "excel_key": excel_key,
         "total_agent_jobs": len(agent_queue),
@@ -86,6 +98,9 @@ def _write_manifest(
                 "canvas_user_id": job["canvas_user_id"],
                 "canvas_course_id": job["canvas_course_id"],
                 "fired_rules": job["fired_rules"],
+                "fired_rules_no_ml": job.get("fired_rules_no_ml"),
+                "at_risk_predicted": job.get("at_risk_predicted"),
+                "at_risk_probability": job.get("at_risk_probability"),
             }
             for job in agent_queue
         ],
@@ -101,7 +116,7 @@ def _write_manifest(
     return key
 
 # --- Agent fan-out helpers ---
-def _invoke_attribution(student: dict, manifest_key: str, bucket: str, as_of_date: str) -> None:
+def _invoke_attribution(student: dict, manifest_key: str, bucket: str, as_of_date: str, mode: str = "production") -> None:
     boto3.client("lambda", region_name=os.environ["AWS_DEFAULT_REGION"]).invoke(
         FunctionName = os.environ["ATTRIBUTION_FUNCTION_NAME"],
         InvocationType = "Event",
@@ -109,6 +124,10 @@ def _invoke_attribution(student: dict, manifest_key: str, bucket: str, as_of_dat
             "canvas_user_id": student["canvas_user_id"],
             "canvas_course_id": student["canvas_course_id"],
             "fired_rules": student["fired_rules"],
+            "fired_rules_no_ml": student.get("fired_rules_no_ml"),
+            "at_risk_predicted": student.get("at_risk_predicted"),
+            "at_risk_probability": student.get("at_risk_probability"),
+            "mode": mode,
             "manifest_key": manifest_key,
             "s3_bucket": bucket,
             "as_of_date": as_of_date,
@@ -173,6 +192,7 @@ def lambda_handler(event, context):
             canvas_course_ids=canvas_course_ids,
             s3_bucket=bucket,
             as_of_date=as_of_date,
+            research_mode=(CHIRON_MODE == "research"),
         )
     except Exception as e:
         logger.exception("Batch job failed: %s", e)
@@ -190,14 +210,15 @@ def lambda_handler(event, context):
         excel_key=result["s3_excel"].replace(f"s3://{bucket}/", ""),
         agent_queue=agent_queue,
         as_of_date=as_of_date,
-        run_id=run_id
+        run_id=run_id,
+        mode=CHIRON_MODE
     )
     agent_launched = 0
 
     if agent_queue:
         for student in agent_queue:
             try:
-                _invoke_attribution(student, manifest_key, bucket, as_of_date)
+                _invoke_attribution(student, manifest_key, bucket, as_of_date, mode=CHIRON_MODE)
                 agent_launched += 1
             except Exception as e:
                 logger.error("Failed to invoke attribution for student %d in course %d: %s", 
