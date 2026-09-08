@@ -52,7 +52,17 @@ CONSTRUCT SCORING RULES:
 - mot (Motivation):   1-6, HIGHER is better.
 - abur (Stress):      1-6, HIGHER means MORE stressed.
 - res (Resilience):   1-6, LOWER means LESS resilient.
- 
+
+GRADE FIELDS (from get_missing_assignments):
+- latest_current_grade: the student's overall course grade (0-100). Provided for context only —
+  it does NOT trigger any alert category on its own.
+- latest_quiz_score: the student's most recent Chiron quiz score (0-100). This is the
+  SOLE trigger for Neg: Exam/Quiz Performance. Below 60 = poor quiz performance.
+- latest_missing_assignments: the student's most recent missing assignment count.
+- history: full weekly snapshot of missing_assignments and quiz_score ordered oldest to newest.
+  Use the trend to distinguish chronic issues from sudden drops or improving trajectories —
+  this context is key when choosing the root cause category.
+  
 Click z-scores: 0 = course average. Below -1.0 = warning. Below -2.0 = strong warning.
 """
 
@@ -114,7 +124,7 @@ def _all_jobs_done(bucket: str, manifest: dict) -> bool:
     
     expected = {
         f"agent_results/{date_prefix}/{job['canvas_user_id']}_{job['canvas_course_id']}.json"
-        for job in manifest["jobs"]
+        for job in manifest["agent_jobs"]
     }
     missing = expected - done_keys
     if missing:
@@ -144,8 +154,8 @@ def lambda_handler(event, context):
     bucket = event["s3_bucket"]
     as_of_date = event["as_of_date"]
     
-    logger.info("Attribution for user %d in course %d with rules %s", 
-                canvas_user_id, canvas_course_id, as_of_date, fired_rules)
+    logger.info("Attribution for canvas_user_id=%s canvas_course_id=%s as_of=%s fired=%s",
+            canvas_user_id, canvas_course_id, as_of_date, fired_rules)
     
     try:
         mydb_cfg, timescale_cfg = _build_db_configs()

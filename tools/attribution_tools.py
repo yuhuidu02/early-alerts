@@ -180,38 +180,55 @@ class AttributionToolkit:
         @tool
         def get_missing_assignments(student_id: int) -> str:
             """
-            Retrieves the student's current missing assignment count and current grade.
+            Retrieves the full snapshot history of a student's missing assignment count
+            and quiz score (Chiron survey performance) up to as_of_date, ordered oldest
+            to newest. Use the trend — not just the latest value — to assess whether
+            the issue is worsening, improving, or chronic.
  
             Args:
                 student_id (int): The student's internal mydb id.
  
             Returns:
-                str: JSON with student name, missing assignment count, and current grade.
+                str: JSON with student name, latest values, and full weekly history
+                     of missing_assignments and quiz_score.
             """
             rows = toolkit._query_mydb("""
-                SELECT DISTINCT ON (s.id)
+                SELECT
                     s.name,
                     ss.missing_assignments,
-                    ss.current_score
+                    ss.current_score,
+                    ss.quiz_score,
+                    ss.recorded_at
                 FROM students s
                 JOIN student_score_snapshots ss ON ss.student_id = s.id
                 WHERE s.id = %s
                   AND ss.recorded_at <= %s
-                ORDER BY s.id, ss.recorded_at DESC
-            """, (student_id, toolkit._as_of_date))
+                ORDER BY ss.recorded_at ASC
+            """, (student_id, toolkit.as_of_date))
 
             if not rows:
                 return json.dumps({"error": "Student not found"})
+            
+            history = [
+                {
+                    "recorded_at": str(row["recorded_at"])[:10],
+                    "missing_assignments": row["missing_assignments"],
+                    "quiz_score": float(row["quiz_score"]) if row["quiz_score"] is not None else None,
+                }
+                for row in rows
+            ]
  
-            row = rows[0]
+            latest = rows[-1]  # oldest record is last due to DESC order
             return json.dumps({
-                "student_name":        row["name"],
-                "missing_assignments": row["missing_assignments"],
-                "current_grade":       float(row["current_score"]) if row["current_score"] else None,
+                "student_name":        latest["name"],
+                "latest_missing_assignments": latest["missing_assignments"],
+                "latest_quiz_score":          float(latest["quiz_score"]) if latest["quiz_score"] is not None else None,
+                "latest_current_grade":       float(latest["current_score"]) if latest["current_score"] is not None else None,
+                "history":                    history,
             }, indent=2)
-        
+
         return get_missing_assignments
-    
+
     def _make_withdrawal_tool(self):
         toolkit = self
 
@@ -245,7 +262,7 @@ class AttributionToolkit:
                   AND qs.submitted_at <= %s
                   AND q.code IN ('with_v2', 'supp')
                 ORDER BY qs.submitted_at ASC, q.code
-            """, (student_id, course_id, toolkit._as_of_date))
+            """, (student_id, course_id, toolkit.as_of_date))
 
             if not rows:
                 return json.dumps({"error": "No quiz submissions found for this student and course."})
@@ -268,7 +285,7 @@ class AttributionToolkit:
             flags: dict[str, Any] = {}
             if latest_with:
                 flags["withdrawal_latest"] = latest_with[-1]["response"]
-                flags["withdrawal_risk"] = latest_with[-1["raw_score"]] == 3
+                flags["withdrawal_risk"] = latest_with[-1]["raw_score"] == 3
             if latest_supp:
                 flags["support_latest"] = latest_supp[-1]["response"]
                 flags["support_requested"] = latest_supp[-1]["raw_score"] == 3
@@ -304,19 +321,19 @@ class AttributionToolkit:
                 WHERE user_id = %s AND course_id = %s AND timestamp <= %s
                 GROUP BY week_start
                 ORDER BY week_start ASC
-            """, (click_student_id, click_course_id, toolkit._as_of_date))
+            """, (click_student_id, click_course_id, toolkit.as_of_date))
 
             last_active_row = toolkit._query_timescale("""
                 SELECT MAX(timestamp) AS last_active
                 FROM click_sequences
                 WHERE user_id = %s AND course_id = %s AND timestamp <= %s
-            """, (click_student_id, click_course_id, toolkit._as_of_date))
+            """, (click_student_id, click_course_id, toolkit.as_of_date))
 
             sequence_rows = toolkit._query_timescale("""
                 SELECT label FROM click_sequences
                 WHERE user_id = %s AND course_id = %s AND timestamp <= %s
                 ORDER BY timestamp ASC
-            """, (click_student_id, click_course_id, toolkit._as_of_date))
+            """, (click_student_id, click_course_id, toolkit.as_of_date))
 
             if not sequence_rows:
                 return json.dumps({"error": "No click data found for this student and course."})
@@ -345,7 +362,7 @@ class AttributionToolkit:
             all_students = toolkit._query_timescale("""
                 SELECT DISTINCT user_id FROM click_sequences
                 WHERE course_id = %s AND timestamp <= %s
-            """, (click_course_id, toolkit._as_of_date))
+            """, (click_course_id, toolkit.as_of_date))
 
             all_breadths, all_depths = [], []
             for row in all_students:
@@ -353,7 +370,7 @@ class AttributionToolkit:
                     SELECT label FROM click_sequences
                     WHERE user_id = %s AND course_id = %s AND timestamp <= %s
                     ORDER BY timestamp ASC
-                """, (row["user_id"], click_course_id, toolkit._as_of_date))
+                """, (row["user_id"], click_course_id, toolkit.as_of_date))
                 if rows:
                     b, d = compute_features([r["label"] for r in rows])
                     all_breadths.append(b)

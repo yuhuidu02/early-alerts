@@ -3,7 +3,7 @@ early_alerts/batch_handler.py
 
 Lambda entry point for batch student categorization.
 
-Flow: 
+Flow (CHIRON_MODE="production", the default):
 1. Run bulk categorization across all active courses
 2. Write CSV/Excel to S3 (CAT_NEEDS_AGENT rows are placeholders)
 3. Write manifest.json to S3 listing all agent jobs
@@ -65,6 +65,7 @@ def _write_manifest(
         excel_key: str,
         agent_queue: list,
         as_of_date: str,
+        run_id: str = None
 ) -> str:
     """
     Writes a manifest.json to S3 that tracks:
@@ -76,6 +77,7 @@ def _write_manifest(
         "batch_timestamp": batch_timestamp,
         "date_prefix": date_prefix,
         "as_of_date": as_of_date,
+        "run_id": run_id,
         "csv_key": csv_key,
         "excel_key": excel_key,
         "total_agent_jobs": len(agent_queue),
@@ -114,17 +116,30 @@ def _invoke_attribution(student: dict, manifest_key: str, bucket: str, as_of_dat
     )
     logger.info("Invoked attribution for student %d in course %d",
                 student["canvas_user_id"], student["canvas_course_id"])
-    
+
+def _invoke_merge(bucket: str, manifest_key: str) -> None:
+    boto3.client("lambda", region_name=os.environ["AWS_DEFAULT_REGION"]).invoke(
+        FunctionName = os.environ["MERGE_FUNCTION_NAME"],
+        InvocationType = "Event",
+        Payload = json.dumps({
+            "s3_bucket": bucket,
+            "manifest_key": manifest_key,
+        }),
+    )
+    logger.info("Invoked merge for manifest s3://%s/%s", bucket, manifest_key)
+
 # --- Lambda handler ---
 def lambda_handler(event, context):
     try:
         body = json.loads(event["body"]) if isinstance(event.get("body"), str) else event.get("body", event)
         canvas_course_ids = body.get("canvas_course_ids") if body else None
         as_of_date = body.get("as_of_date") if body else None
+        run_id = body.get("run_id") if body else None
     except Exception:
         canvas_course_ids = None
         as_of_date = None
-    
+        run_id = None
+
     # Default as_of_date to today if not supplied
     if not as_of_date:
         as_of_date = datetime.utcnow().strftime("%Y-%m-%d")
@@ -167,19 +182,19 @@ def lambda_handler(event, context):
     batch_timestamp = result["batch_timestamp"]
     date_prefix = result["date_prefix"]
 
-    manifest_key = None
+    manifest_key = _write_manifest(
+        bucket=bucket,
+        batch_timestamp=batch_timestamp,
+        date_prefix=date_prefix,
+        csv_key=result["s3_csv"].replace(f"s3://{bucket}/", ""),
+        excel_key=result["s3_excel"].replace(f"s3://{bucket}/", ""),
+        agent_queue=agent_queue,
+        as_of_date=as_of_date,
+        run_id=run_id
+    )
     agent_launched = 0
 
     if agent_queue:
-        manifest_key = _write_manifest(
-            bucket=bucket,
-            batch_timestamp=batch_timestamp,
-            date_prefix=date_prefix,
-            csv_key=result["csv_key"].replace(f"s3://{bucket}/", ""),
-            excel_key=result["excel_key"].replace(f"s3://{bucket}/", ""),
-            agent_queue=agent_queue,
-            as_of_date=as_of_date,
-        )
         for student in agent_queue:
             try:
                 _invoke_attribution(student, manifest_key, bucket, as_of_date)
@@ -187,6 +202,13 @@ def lambda_handler(event, context):
             except Exception as e:
                 logger.error("Failed to invoke attribution for student %d in course %d: %s", 
                              student["canvas_user_id"], student["canvas_course_id"], str(e))
+    else:
+        # no student needed agent review - nothing to wait on
+        # Invoke merge directly so _final files get written and chiron_runs is marked complete.
+        try:
+            _invoke_merge(bucket, manifest_key)
+        except Exception as e:
+            logger.error("Failed to invoke merge for manifest %s: %s", manifest_key, str(e))
 
     result["agent_launched"] = agent_launched
     result["manifest_key"] = manifest_key

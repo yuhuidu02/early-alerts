@@ -21,16 +21,29 @@ import csv
 import logging
 import os
 from datetime import datetime
+from collections import defaultdict
 
 import boto3
-import openyxl 
+import openpyxl 
+import psycopg2
+import psycopg2.extras
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
-from batch_categorize import CATEGORY_ORDER, build_xlsx_bytes, CAT_NEEDS_AGENT
+from batch_categorize import CATEGORY_ORDER, build_xlsx_bytes, CAT_NEEDS_AGENT, CSV_FIELDS
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+# # --- Category mapping: batch_categorize full strings -> alerts table short codes ---
+CATEGORY_MAP = {
+    "Neg: Never Attended / No WebCampus Activity":        "never_attended",
+    "Neg: Missing Assignment(s)":                         "missing_assignments",
+    "Neg: Lack of Engagement or Infrequent Attendance":   "low_engagement",
+    "Neg: Exam/Quiz Performance":                         "exam_performance",
+    "Positive: Satisfactory Course Performance":          "satisfactory",
+    "Positive: Exceptional Course Performance":           "exceptional",
+}
 
 # --- S3 Helpers ---
 def _read_json(bucket: str, key: str) -> dict:
@@ -72,6 +85,68 @@ def _collect_agent_results(bucket: str, manifest: dict) -> dict:
 
     logger.info("Collected %d/%d agent results", len(results), manifest["total_agent_jobs"])
     return results
+
+# --- Write Chiron results to alerts table ---
+def _write_alerts_to_db(mydb_cfg: dict, merged_rows: list, alert_date: str):
+    inserts = []
+    skipped = 0
+
+    for row in merged_rows:
+        category_short = CATEGORY_MAP.get(row["category"])
+        if not category_short:
+            logger.warning("Skipping row with unmapped category: %s", row["category"])
+            skipped += 1
+            continue
+        inserts.append((
+            int(row["canvas_user_id"]),
+            int(row["canvas_course_id"]),
+            category_short,
+            alert_date,
+        ))
+
+    if not inserts:
+        logger.info("No valid rows to insert into DB.")
+        return
+    
+    try:
+        with psycopg2.connect(**mydb_cfg) as conn:
+            with conn.cursor() as cur:
+                canvas_user_ids = list({r[0] for r in inserts})
+                canvas_course_ids = list({r[1] for r in inserts})
+                cur.execute("""
+                    SELECT canvas_user_id, id FROM students
+                    WHERE canvas_user_id = ANY(%s)
+                """, (canvas_user_ids,))
+                student_map = {r[0]: r[1] for r in cur.fetchall()}
+
+                cur.execute("""
+                    SELECT canvas_course_id, id FROM courses
+                    WHERE canvas_course_id = ANY(%s)
+                """, (canvas_course_ids,))
+                course_map = {r[0]: r[1] for r in cur.fetchall()}
+
+                rows_to_insert = []
+                for canvas_uid, canvas_cid, category, alert_date in inserts:
+                    student_id = student_map.get(canvas_uid)
+                    course_id = course_map.get(canvas_cid)
+                    if not student_id or not course_id:
+                        logger.warning("Skipping row with missing student/course: %s, %s", canvas_uid, canvas_cid)
+                        skipped += 1
+                        continue
+                    rows_to_insert.append((student_id, course_id, alert_date, category))
+                
+                psycopg2.extras.execute_values(cur, """
+                    INSERT INTO alerts (student_id, course_id, alert_date, entry_type, category)
+                    VALUES %s
+                """, [(sid, cid, ad, "chiron", cat) for sid, cid, ad, cat in rows_to_insert])
+            
+            conn.commit()
+
+        logger.info("Inserted %d rows into alerts table (%d skipped)", len(rows_to_insert), skipped)
+
+    except Exception as e:
+        logger.error("Failed to write alerts to DB: %s", e)
+        # non-blocking — S3 write already succeeded
 
 # --- Merge --- 
 def _merge(original_rows: list, agent_results: dict) -> list:
@@ -124,6 +199,13 @@ def lambda_handler(event, context):
     # 4. Merge
     merged_rows = _merge(original_rows, agent_results)
 
+    try:
+        from batch_handler import _build_db_configs
+        mydb_cfg, _ = _build_db_configs()
+        _write_alerts_to_db(mydb_cfg, merged_rows, manifest["as_of_date"])
+    except Exception as e:
+        logger.error("alert DB write failed (non-blocking): %s", e)
+
     resolved_count = sum(
         1 for row in merged_rows 
         if row["category"] != CAT_NEEDS_AGENT
@@ -137,41 +219,114 @@ def lambda_handler(event, context):
         records.append({
             "canvas_user_id":      int(row["canvas_user_id"]),
             "student_name":        row["student_name"],
+            "nshe_id":             row["nshe_id"],
             "course_name":         row["course_name"],
             "canvas_course_id":    int(row["canvas_course_id"]),
+            "section_number":      row["section_number"],
             "category":            row["category"],
             "fired_rules":         [r for r in row.get("fired_rules", "").split(" | ") if r],
             "current_grade":       float(row["current_grade"]) if row.get("current_grade") else None,
+            "quiz_score":          float(row["quiz_score"]) if row.get("quiz_score") else None,
             "missing_assignments": int(row["missing_assignments"]) if row.get("missing_assignments") else 0,
             "total_clicks":        int(row["total_clicks"]) if row.get("total_clicks") else 0,
-            "breadth_z":           float(row["breadth_z"]) if row.get("breadth_z") else None,
+            "click_coverage_z":    float(row["click_coverage_z"]) if row.get("click_coverage_z") else None,
+            "click_intensity_z":    float(row["click_intensity_z"]) if row.get("click_intensity_z") else None,
+            "click_coherence_z":    float(row["click_coherence_z"]) if row.get("click_coherence_z") else None,
             "last_active":         row.get("last_active"),
         })
- 
-    # 6. Build final CSV
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=list(merged_rows[0].keys()))
-    writer.writeheader()
-    writer.writerows(merged_rows)
-    csv_bytes = buf.getvalue().encode("utf-8")
- 
-    # 7. Write final files
-    final_csv_key   = f"{date_prefix}/alerts_{batch_timestamp}_final.csv"
-    final_excel_key = f"{date_prefix}/alerts_{batch_timestamp}_final.xlsx"
- 
-    s3_csv   = _upload(csv_bytes,               bucket, final_csv_key,
-                       "text/csv")
-    s3_excel = _upload(build_xlsx_bytes(records), bucket, final_excel_key,
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
- 
-    logger.info("Merge complete. Final files written.")
- 
+
+    # 6. Group records by canvas_course_id
+    by_course = defaultdict(list)
+    for rec in records:
+        by_course[rec["canvas_course_id"]].append(rec)
+
+    # 7. Write one CSV + one XLSX per course
+    s3_files = {}
+    for canvas_course_id, course_records in by_course.items():
+        final_csv_key   = f"{date_prefix}/alerts_{batch_timestamp}_{canvas_course_id}_final.csv"
+        final_excel_key = f"{date_prefix}/alerts_{batch_timestamp}_{canvas_course_id}_final.xlsx"
+
+        # CSV
+        buf = io.StringIO()
+        flat = []
+        for r in course_records:
+            row = dict(r)
+            row["fired_rules"] = "|".join(r.get("fired_rules") or [])
+            flat.append(row)
+        writer = csv.DictWriter(buf, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(flat)
+        csv_bytes = buf.getvalue().encode("utf-8")
+
+        s3_csv = _upload(csv_bytes, bucket, final_csv_key, "text/csv")
+        s3_excel = _upload(
+            build_xlsx_bytes(course_records), bucket, final_excel_key,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        s3_files[canvas_course_id] = {"csv": s3_csv, "excel": s3_excel}
+
+    logger.info("Merge complete. Final files written for %d courses.", len(s3_files))
+
+    # update chiron_runs status if this was instructor-triggered
+    run_id = manifest.get("run_id")
+    if run_id:
+        try:
+            password = boto3.client("secretsmanager", region_name=os.environ["AWS_DEFAULT_REGION"]) \
+                       .get_secret_value(SecretId=os.environ["DB_SECRET_NAME"])["SecretString"]
+            mydb_cfg = {
+                "host": os.environ["MYDB_HOST"],
+                "port": int(os.environ.get("MYDB_PORT", 5432)),
+                "dbname": os.environ["MYDB_NAME"],
+                "user": "dbuser",
+                "password": password,
+                "sslmode": "prefer",
+                "connect_timeout": 10,
+            }
+            with psycopg2.connect(**mydb_cfg) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE chiron_runs SET status = 'complete' WHERE id = %s",
+                        (run_id,)
+                    )
+                conn.commit()
+            logger.info("Updated chiron_runs status to 'complete' for run_id=%s", run_id)
+        except Exception as e:
+            logger.warning("Could not update chiron_runs: %s", e)  # non-fatal
+
     return {
         "statusCode": 200,
         "body": json.dumps({
             "total":          len(merged_rows),
             "agent_resolved": len(agent_results),
-            "s3_csv":         s3_csv,
-            "s3_excel":       s3_excel,
+            "files_by_course": s3_files,
         }),
     }
+
+ 
+    # # 6. Build final CSV
+    # buf = io.StringIO()
+    # writer = csv.DictWriter(buf, fieldnames=list(merged_rows[0].keys()))
+    # writer.writeheader()
+    # writer.writerows(merged_rows)
+    # csv_bytes = buf.getvalue().encode("utf-8")
+ 
+    # # 7. Write final files
+    # final_csv_key   = f"{date_prefix}/alerts_{batch_timestamp}_final.csv"
+    # final_excel_key = f"{date_prefix}/alerts_{batch_timestamp}_final.xlsx"
+ 
+    # s3_csv   = _upload(csv_bytes,               bucket, final_csv_key,
+    #                    "text/csv")
+    # s3_excel = _upload(build_xlsx_bytes(records), bucket, final_excel_key,
+    #                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+ 
+    # logger.info("Merge complete. Final files written.")
+ 
+    # return {
+    #     "statusCode": 200,
+    #     "body": json.dumps({
+    #         "total":          len(merged_rows),
+    #         "agent_resolved": len(agent_results),
+    #         "s3_csv":         s3_csv,
+    #         "s3_excel":       s3_excel,
+    #     }),
+    # }

@@ -18,6 +18,7 @@ Output written to S3:
 import csv
 import io
 import logging
+import re
 import statistics
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -50,6 +51,8 @@ CATEGORY_ORDER = [
     CAT_NEEDS_AGENT
 ]
 
+
+
 # --- DB helpers ---
 def _query(cfg: dict, sql: str, params=None) -> list:
     with psycopg2.connect(**cfg) as conn:
@@ -59,9 +62,42 @@ def _query(cfg: dict, sql: str, params=None) -> list:
         
 # --- Stage 1a. Student roster (mydb) ---
 
+# def fetch_student_roster(mydb_cfg: dict, canvas_course_ids: list, as_of_date: str) -> list:
+#     """
+#     Fetches the most recent score snapshot per (student, course) on or before as_of_date.
+#     Uses student_score_snapshots instead of students table for historical accuracy.
+#     """
+#     ph = ",".join(["%s"] * len(canvas_course_ids))
+#     rows = _query(mydb_cfg, f"""
+#         SELECT DISTINCT ON (s.canvas_user_id, c.canvas_course_id)
+#             s.canvas_user_id,
+#             s.id            AS student_id,
+#             s.name,
+#             s.integration_id,
+#             ss.missing_assignments,
+#             ss.current_score,
+#             ss.quiz_score,
+#             sc.section_number,
+#             c.canvas_course_id,
+#             c.id              AS course_id,
+#             c.name            AS course_name
+#         FROM students s
+#         JOIN student_courses sc ON sc.student_id = s.id
+#         JOIN courses c          ON c.id = sc.course_id
+#         JOIN student_score_snapshots ss ON ss.student_id = s.id AND ss.course_id = c.id
+#         WHERE c.canvas_course_id IN ({ph})
+#             AND ss.recorded_at <= %s
+#             AND sc.status = 'active' 
+#         ORDER BY s.canvas_user_id, c.canvas_course_id, ss.recorded_at DESC
+#     """, canvas_course_ids + [as_of_date])
+#     logger.info("Roster: %d student-course rows across %d courses (as of %s)", 
+#                 len(rows), len(canvas_course_ids), as_of_date)
+#     return rows
+
 def fetch_student_roster(mydb_cfg: dict, canvas_course_ids: list, as_of_date: str) -> list:
     """
-    Fetches the most recent score snapshot per (student, course) on or before as_of_date.
+    Fetches the latest score snapshot per (student, course), regardless of when
+    Chiron is run. current_score always reflects the most recent data available.
     Uses student_score_snapshots instead of students table for historical accuracy.
     """
     ph = ",".join(["%s"] * len(canvas_course_ids))
@@ -70,8 +106,11 @@ def fetch_student_roster(mydb_cfg: dict, canvas_course_ids: list, as_of_date: st
             s.canvas_user_id,
             s.id            AS student_id,
             s.name,
+            s.integration_id,
             ss.missing_assignments,
             ss.current_score,
+            ss.quiz_score,
+            sc.section_number,
             c.canvas_course_id,
             c.id              AS course_id,
             c.name            AS course_name
@@ -80,10 +119,10 @@ def fetch_student_roster(mydb_cfg: dict, canvas_course_ids: list, as_of_date: st
         JOIN courses c          ON c.id = sc.course_id
         JOIN student_score_snapshots ss ON ss.student_id = s.id AND ss.course_id = c.id
         WHERE c.canvas_course_id IN ({ph})
-            AND ss.recorded_at <= %s
+            AND sc.status = 'active' 
         ORDER BY s.canvas_user_id, c.canvas_course_id, ss.recorded_at DESC
-    """, canvas_course_ids + [as_of_date])
-    logger.info("Roster: %d student-course rows across %d courses (as of %s)", 
+    """, canvas_course_ids)
+    logger.info("Roster: %d student-course rows across %d courses (latest snapshot, requested as_of_date=%s)", 
                 len(rows), len(canvas_course_ids), as_of_date)
     return rows
 
@@ -91,99 +130,211 @@ def fetch_student_roster(mydb_cfg: dict, canvas_course_ids: list, as_of_date: st
 
 def fetch_click_signals(timescale_cfg: dict, canvas_course_ids: list, as_of_date: str) -> dict:
     """
-    Returns dict keyed by (canvas_user_id, canvas_course_id).
-    All click data filtered to timestamp <= as_of_date.
-    Z-scores computed against the course population up to that same date
-    for a true historical snapshot.
+    Reads pre-computed click stats from student_click_stats table.
+    Z-score computed against course population from the same table
+    Falls back to empty dict if no stats found on or before as_of_date.
     """
     ph = ",".join(["%s"] * len(canvas_course_ids))
 
-    course_map = {
-        r["canvas_course_id"]: r["id"]
-        for r in _query(timescale_cfg,
-                        f"SELECT canvas_course_id, id FROM courses WHERE canvas_course_id IN ({ph})",
-                        canvas_course_ids)
-    }
-    if not course_map:
-        logger.warning("No matching courses found in timescale for canvas_course_ids: %s", canvas_course_ids)
+    rows = _query(timescale_cfg, f"""
+        SELECT
+            s.canvas_user_id,
+            c.canvas_course_id,
+            scs.total_clicks,
+            scs.click_slope,
+            scs.last_active,
+            scs.coverage,
+            scs.intensity,
+            scs.coherence,
+            AVG(scs.coverage)  OVER (PARTITION BY scs.course_id) AS course_avg_coverage,
+            STDDEV(scs.coverage) OVER (PARTITION BY scs.course_id) AS course_std_coverage,
+            AVG(scs.intensity)  OVER (PARTITION BY scs.course_id) AS course_avg_intensity,
+            STDDEV(scs.intensity) OVER (PARTITION BY scs.course_id) AS course_std_intensity,
+            AVG(scs.coherence)  OVER (PARTITION BY scs.course_id) AS course_avg_coherence,
+            STDDEV(scs.coherence) OVER (PARTITION BY scs.course_id) AS course_std_coherence
+        FROM student_click_stats scs
+        JOIN students s  ON s.id  = scs.student_id
+        JOIN courses c   ON c.id  = scs.course_id
+        WHERE c.canvas_course_id IN ({ph})
+          AND scs.as_of_date = (
+                SELECT MAX(as_of_date)
+                FROM student_click_stats
+                WHERE course_id = scs.course_id
+                AND as_of_date <= %s
+            )
+    """, canvas_course_ids + [as_of_date])
+
+    if not rows:
+        logger.warning("No click stats found for canvas_course_ids: %s as_of_date: %s", canvas_course_ids, as_of_date)
         return {}
     
-    ts_course_ids = list(course_map.values())
-    ph2 = ",".join(["%s"] * len(ts_course_ids))
+    logger.info("Fetched %d click stats rows for %d courses (as of %s)", len(rows), len(canvas_course_ids), as_of_date)
 
-    student_map = {
-        r["canvas_user_id"]: r["id"]
-        for r in _query(timescale_cfg, f"""
-            SELECT DISTINCT s.canvas_user_id, s.id
-            FROM students s
-            JOIN click_sequences cs ON cs.user_id = s.id
-            WHERE cs.course_id IN ({ph2})
-            AND cs.timestamp <= %s
-        """, ts_course_ids + [as_of_date])
-    }
-    
-    logger.info("Fetching all click events up to %s for %d courses...", as_of_date, len(ts_course_ids))
-
-    all_clicks = _query(timescale_cfg, f"""
-        SELECT user_id, course_id, label, timestamp
-        FROM click_sequences
-        WHERE course_id IN ({ph2})
-            AND timestamp <= %s
-        ORDER BY user_id, course_id, timestamp ASC
-    """, ts_course_ids + [as_of_date])
-    logger.info("Fetched %d click events", len(all_clicks))
-
-    sequences:     dict = defaultdict(list)
-    last_active:   dict = {}
-    weekly_counts: dict = defaultdict(lambda: defaultdict(int)) # (user_id, course_id) -> week -> count
-
-    for row in all_clicks:
-        key = (row["user_id"], row["course_id"])
-        sequences[key].append(row["label"])
-        ts = row["timestamp"]
-        if key not in last_active or ts > last_active[key]:
-            last_active[key] = ts
-        weekly_counts[key][ts.strftime("%Y-W%W")] += 1
-    
-    course_breadths: dict = defaultdict(list)
-    student_breadth: dict = {}
-
-    for (uid, cid), seq in sequences.items():
-        breadth = len(set(seq))
-        course_breadths[cid].append(breadth)
-        student_breadth[(uid, cid)] = breadth
-
-    def z_score(value, population):
-        if len(population) < 2:
+    def z_score(value, avg, std):
+        if not std or std == 0:
             return 0.0
-        std = statistics.stdev(population)
-        return 0.0 if std == 0 else round((value - statistics.mean(population)) / std, 2)
+        return round((value - avg) / std, 2)
     
-    rev_student = {v: k for k, v in student_map.items()}
-    rev_course  = {v: k for k, v in course_map.items()}
-
     result = {}
+    for row in rows:
+        coverage = row["coverage"] or 0
+        intensity = row["intensity"] or 0
+        coherence = row["coherence"] or 0
 
-    for (uid, cid), breadth in student_breadth.items():
-        canvas_uid = rev_student.get(uid)
-        canvas_cid = rev_course.get(cid)
-        if canvas_uid is None or canvas_cid is None:
-            continue
-        wk_vals = sorted(weekly_counts[(uid, cid)].values())
-        la = last_active.get((uid, cid))
-        result[(canvas_uid, canvas_cid)] = {
-            "total_clicks": sum(wk_vals),
-            "click_slope": (wk_vals[-1] - wk_vals[-2]) if len(wk_vals) >= 2 else 0,
-            "last_active": str(la)[:10] if la else None,
-            "breadth": breadth,
-            "breadth_z": z_score(breadth, course_breadths[cid])
+        result[(row["canvas_user_id"], row["canvas_course_id"])] = {
+            "total_clicks": row["total_clicks"] or 0,
+            "click_slope": row["click_slope"] or 0,
+            "last_active": str(row["last_active"])[:10] if row["last_active"] else None,
+            "breadth": coverage,
+            "breadth_z": z_score(coverage, row["course_avg_coverage"], row["course_std_coverage"]),
+            "intensity": intensity,
+            "intensity_z": z_score(intensity, row["course_avg_intensity"], row["course_std_intensity"]),
+            "coherence": coherence,
+            "coherence_z": z_score(coherence, row["course_avg_coherence"], row["course_std_coherence"]),
         }
+
     logger.info("Processed click signals for %d student-course pairs", len(result))
+    return result
+
+
+
+# def fetch_click_signals(timescale_cfg: dict, canvas_course_ids: list, as_of_date: str) -> dict:
+#     """
+#     Returns dict keyed by (canvas_user_id, canvas_course_id).
+#     All click data filtered to timestamp <= as_of_date.
+#     Z-scores computed against the course population up to that same date
+#     for a true historical snapshot.
+#     """
+#     ph = ",".join(["%s"] * len(canvas_course_ids))
+
+#     course_map = {
+#         r["canvas_course_id"]: r["id"]
+#         for r in _query(timescale_cfg,
+#                         f"SELECT canvas_course_id, id FROM courses WHERE canvas_course_id IN ({ph})",
+#                         canvas_course_ids)
+#     }
+#     if not course_map:
+#         logger.warning("No matching courses found in timescale for canvas_course_ids: %s", canvas_course_ids)
+#         return {}
+    
+#     ts_course_ids = list(course_map.values())
+#     ph2 = ",".join(["%s"] * len(ts_course_ids))
+
+#     student_map = {
+#         r["canvas_user_id"]: r["id"]
+#         for r in _query(timescale_cfg, f"""
+#             SELECT DISTINCT s.canvas_user_id, s.id
+#             FROM students s
+#             JOIN click_sequences cs ON cs.user_id = s.id
+#             WHERE cs.course_id IN ({ph2})
+#             AND cs.timestamp <= %s
+#         """, ts_course_ids + [as_of_date])
+#     }
+
+#     logger.info("Fetching all click events up to %s for %d courses...", as_of_date, len(ts_course_ids))
+
+#     all_clicks = _query(timescale_cfg, f"""
+#         SELECT user_id, course_id, label, timestamp
+#         FROM click_sequences
+#         WHERE course_id IN ({ph2})
+#             AND timestamp <= %s
+#         ORDER BY user_id, course_id, timestamp ASC
+#     """, ts_course_ids + [as_of_date])
+#     logger.info("Fetched %d click events", len(all_clicks))
+
+#     sequences:     dict = defaultdict(list)
+#     last_active:   dict = {}
+#     weekly_counts: dict = defaultdict(lambda: defaultdict(int)) # (user_id, course_id) -> week -> count
+
+#     for row in all_clicks:
+#         key = (row["user_id"], row["course_id"])
+#         sequences[key].append(row["label"])
+#         ts = row["timestamp"]
+#         if key not in last_active or ts > last_active[key]:
+#             last_active[key] = ts
+#         weekly_counts[key][ts.strftime("%Y-W%W")] += 1
+    
+#     course_breadths: dict = defaultdict(list)
+#     student_breadth: dict = {}
+
+#     for (uid, cid), seq in sequences.items():
+#         breadth = len(set(seq))
+#         course_breadths[cid].append(breadth)
+#         student_breadth[(uid, cid)] = breadth
+
+#     def z_score(value, population):
+#         if len(population) < 2:
+#             return 0.0
+#         std = statistics.stdev(population)
+#         return 0.0 if std == 0 else round((value - statistics.mean(population)) / std, 2)
+    
+#     rev_student = {v: k for k, v in student_map.items()}
+#     rev_course  = {v: k for k, v in course_map.items()}
+
+#     result = {}
+
+#     for (uid, cid), breadth in student_breadth.items():
+#         canvas_uid = rev_student.get(uid)
+#         canvas_cid = rev_course.get(cid)
+#         if canvas_uid is None or canvas_cid is None:
+#             continue
+#         wk_vals = sorted(weekly_counts[(uid, cid)].values())
+#         la = last_active.get((uid, cid))
+#         result[(canvas_uid, canvas_cid)] = {
+#             "total_clicks": sum(wk_vals),
+#             "click_slope": (wk_vals[-1] - wk_vals[-2]) if len(wk_vals) >= 2 else 0,
+#             "last_active": str(la)[:10] if la else None,
+#             "breadth": breadth,
+#             "breadth_z": z_score(breadth, course_breadths[cid])
+#         }
+#     logger.info("Processed click signals for %d student-course pairs", len(result))
+#     return result
+
+
+# --- Stage 1c. Fetch model predictions (mydb) ---
+def fetch_model_predictions(mydb_cfg: dict, canvas_course_ids: list, as_of_date: str) -> dict:
+    """
+    Reads the latest at-risk prediction per (student, course) on or before as_of_date.
+    Returns dict keyed by (canvas_user_id, canvas_course_id).
+    """
+    ph = ",".join(["%s"] * len(canvas_course_ids))
+    rows = _query(mydb_cfg, f"""
+        SELECT DISTINCT ON (mp.student_id, c.canvas_course_id)
+            s.canvas_user_id,
+            c.canvas_course_id,
+            mp.at_risk_predicted,
+            mp.at_risk_probability
+        FROM model_predictions mp
+        JOIN students s ON s.id = mp.student_id
+        JOIN courses c  ON c.id = mp.course_id
+        WHERE c.canvas_course_id IN ({ph})
+          AND mp.prediction_timestamp <= %s
+        ORDER BY mp.student_id, c.canvas_course_id, mp.prediction_timestamp DESC
+    """, canvas_course_ids + [as_of_date])
+
+    result = {
+        (row["canvas_user_id"], row["canvas_course_id"]): {
+            "at_risk_predicted": bool(row["at_risk_predicted"]),
+            "at_risk_probability": float(row["at_risk_probability"]) if row["at_risk_probability"] is not None else None,
+        }
+        for row in rows
+    }
+    logger.info("Fetched %d model prediction rows for %d courses (as of %s)",
+                len(result), len(canvas_course_ids), as_of_date)
     return result
 
 # --- Stage 2. Rule evaluation ---
 
-def get_fired_rules(student: dict, click: dict | None) -> list:
+# --- Rule thresholds ---
+# "flagged" = ML layer already predicted at-risk -> fire the deterministic rules more sensitively. 
+# Fixed/deterministic for now; RL-tuned later.
+
+THRESHOLDS = {
+    "default": {"low_engagement_z": -1.5, "low_engagement_min_dims": 2, "quiz_score_cutoff": 70.0, "missing_cutoff": 2},  # placeholder — tune me
+    "flagged": {"low_engagement_z": -1.0, "low_engagement_min_dims": 2, "quiz_score_cutoff": 75.0, "missing_cutoff": 1},  # placeholder — tune me
+}
+
+def get_fired_rules(student: dict, click: dict | None, at_risk_flagged: bool = False) -> list:
     """
     Evaluate all rules and returns every category whose conditions are met.
 
@@ -192,20 +343,29 @@ def get_fired_rules(student: dict, click: dict | None) -> list:
 
     Return a list of 0-4 category strings 
     """
+    t = THRESHOLDS["flagged"] if at_risk_flagged else THRESHOLDS["default"]
+
     grade = float(student["current_score"] or 0)
+    quiz_score = float(student["quiz_score"]) if student["quiz_score"] is not None else None
     missing = int(student["missing_assignments"] or 0)
     bz = click["breadth_z"] if click else 0
+    iz = click["intensity_z"] if click else 0
+    cz = click["coherence_z"] if click else 0
     fired = []
+
     if click is None or click["total_clicks"] == 0:
         fired.append(CAT_NEVER_ATTENDED)
 
-    if missing >= 1:
+    if missing >= t["missing_cutoff"]:
         fired.append(CAT_MISSING_ASSIGNMENTS)
     
-    if bz is not None and bz <= -1.5:
+    # if bz is not None and bz <= -1.5:
+    #     fired.append(CAT_LOW_ENGAGEMENT)
+    low_dimensions = sum([bz <= t["low_engagement_z"], iz <= t["low_engagement_z"], cz <= t["low_engagement_z"]])
+    if low_dimensions >= t["low_engagement_min_dims"]:
         fired.append(CAT_LOW_ENGAGEMENT)
 
-    if grade < 60:
+    if quiz_score is not None and quiz_score < t["quiz_score_cutoff"]:
         fired.append(CAT_EXAM_PERFORMANCE)
     
     return fired
@@ -213,7 +373,7 @@ def get_fired_rules(student: dict, click: dict | None) -> list:
 # The three "investigable" negative categories - only these trigger the agent
 INVESTIGABLE = [CAT_MISSING_ASSIGNMENTS, CAT_LOW_ENGAGEMENT, CAT_EXAM_PERFORMANCE]
 
-def categorize(student: dict, click: dict | None) -> str:
+def categorize(student: dict, click: dict | None, at_risk_flagged: bool = False) -> str:
     """
     Returns (final category, all fired rules).
 
@@ -224,7 +384,7 @@ def categorize(student: dict, click: dict | None) -> str:
       - anything else -> deterministic (1 rule fired)
     """
 
-    fired = get_fired_rules(student, click)
+    fired = get_fired_rules(student, click, at_risk_flagged)
     grade = float(student["current_score"] or 0)
 
     # Never attended is always top priority if it fires
@@ -246,18 +406,18 @@ def categorize(student: dict, click: dict | None) -> str:
 
 # -------------- Output builders ----------------
 CSV_FIELDS = [
-    "canvas_user_id", "student_name", "course_name", "canvas_course_id",
-    "category", "fired_rules", "current_grade", "missing_assignments",
-    "total_clicks", "breadth_z", "last_active",
+    "canvas_user_id", "student_name", "nshe_id", "course_name", "canvas_course_id", "section_number",
+    "category", "fired_rules", "current_grade", "quiz_score", "missing_assignments",
+    "total_clicks", "click_coverage_z", "click_intensity_z", "click_coherence_z", "last_active",
 ]
 
 XLSX_HEADERS = [
-    "Canvas User ID", "Student Name", "Course Name", "Canvas Course ID",
-    "Category", "Fired Rules", "Current Grade (%)", "Missing Assignments",
-    "Total Clicks", "Breadth Z-Score", "Last Active",
+    "Canvas User ID", "Student Name", "NSHE ID", "Course Name", "Canvas Course ID", "Section Number",
+    "Category", "Fired Rules", "Current Grade (%)", "Quiz Score (%)", "Missing Assignments",
+    "Total Clicks", "Click Coverage Z-Score", "Click Intensity Z-Score", "Click Coherence Z-Score", "Last Active",
 ]
 
-COL_WIDTHS = [16, 28, 36, 18, 48, 40, 18, 22, 14, 16, 14]
+COL_WIDTHS = [16, 28, 14, 36, 18, 48, 40, 18, 18, 14, 12, 20, 20, 20, 14]
 
 def build_csv_bytes(records: list) -> bytes:
     buf = io.StringIO()
@@ -265,7 +425,7 @@ def build_csv_bytes(records: list) -> bytes:
     flat = []
     for r in records:
         row = dict(r)
-        row["fired_rules"] = "|".join(r.get("fired_rules"), [])
+        row["fired_rules"] = "|".join(r.get("fired_rules") or [])
         flat.append(row)
     writer = csv.DictWriter(buf, fieldnames=CSV_FIELDS, extrasaction="ignore")
     writer.writeheader()
@@ -274,31 +434,6 @@ def build_csv_bytes(records: list) -> bytes:
 
 def build_xlsx_bytes(records: list) -> bytes:
     wb = openpyxl.Workbook()
-    now = datetime.utcnow()
-
-    # --- Summary sheet ---
-    ws_sum = wb.active
-    ws_sum.title = "Summary"    
-    ws_sum["A1"] = "Early Alert Summary"
-    ws_sum["A1"].font = Font(size=18, bold=True, name="Arial")
-    ws_sum["A2"] = f"Generated on {now.strftime('%Y-%m-%d at %H:%M UTC')}"
-    ws_sum["A2"].font = Font(size=10, italic=True, name="Arial")
-
-    for col, label in enumerate(["Category", "Count", "% of Total"], 1):
-        ws_sum.cell(4, col, label).font = Font(name="Arial", bold=True)
-
-    counts = Counter(r["category"] for r in records)
-    total = len(records)
-    for i, cat in enumerate(CATEGORY_ORDER, 5):
-        count = counts.get(cat, 0)
-        ws_sum.cell(i, 1, cat)
-        ws_sum.cell(i, 2, count)
-        pct = ws_sum.cell(i, 3, count / total if total > 0 else 0)
-        pct.number_format = "0.00%"
-    
-    ws_sum.column_dimensions["A"].width = 50
-    ws_sum.column_dimensions["B"].width = 10
-    ws_sum.column_dimensions["C"].width = 12
 
     def _write_sheet(ws, sheet_records):
         ws.append(XLSX_HEADERS)
@@ -318,32 +453,46 @@ def build_xlsx_bytes(records: list) -> bytes:
             ws.append([
                 rec["canvas_user_id"],
                 rec["student_name"],
+                rec["nshe_id"],
                 rec["course_name"],
                 rec["canvas_course_id"],
+                rec["section_number"],
                 rec["category"],
                 fired_str,
-                rec.get("current_score"),
+                rec.get("current_grade"),
+                rec.get("quiz_score"),
                 rec.get("missing_assignments"),
                 rec.get("total_clicks"),
-                rec.get("breadth_z"),
+                rec.get("click_coverage_z"),
+                rec.get("click_intensity_z"),
+                rec.get("click_coherence_z"),
                 rec.get("last_active"),
             ])
             ri = ws.max_row
-            ws.cell(ri, 7).number_format = "0.0"
-            ws.cell(ri, 10).number_format = "0.00"
-        
+            ws.cell(ri, 9).number_format = "0.0" # current_grade
+            ws.cell(ri, 10).number_format = "0.0" # quiz_score
+            ws.cell(ri, 13).number_format = "0.00" # click_coverage_z
+            ws.cell(ri, 14).number_format = "0.00" # click_intensity_z
+            ws.cell(ri, 15).number_format = "0.00" # click_coherence_z
+
         for i, w in enumerate(COL_WIDTHS, 1):
             ws.column_dimensions[get_column_letter(i)].width = w
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = ws.dimensions
     
-    _write_sheet(wb.create_sheet("All Students"), records)
+    wb.remove(wb.active) # remove default sheet
 
     by_course = defaultdict(list)
     for rec in records:
         by_course[rec["course_name"]].append(rec)
+    INVALID_SHEET_CHARS = r'[]:*?/\\'
+
+    def _safe_sheet_title(name: str) -> str:
+        cleaned = re.sub(f"[{re.escape(INVALID_SHEET_CHARS)}]", "-", name)
+        return cleaned[:31] or "Sheet"
+
     for course_name in sorted(by_course):
-        _write_sheet(wb.create_sheet(course_name[:31]), by_course[course_name])
+        _write_sheet(wb.create_sheet(_safe_sheet_title(course_name)), by_course[course_name])
     
     buf = io.BytesIO()
     wb.save(buf)
@@ -388,24 +537,32 @@ def run(
 
     roster = fetch_student_roster(mydb_cfg, canvas_course_ids, as_of_date)
     click_signals = fetch_click_signals(timescale_cfg, canvas_course_ids, as_of_date)
+    model_predictions = fetch_model_predictions(mydb_cfg, canvas_course_ids, as_of_date)
 
     records = []
     agent_queue = []
 
     for student in roster:
         click = click_signals.get((student["canvas_user_id"], student["canvas_course_id"]))
-        category, fired = categorize(student, click)
+        prediction = model_predictions.get((student["canvas_user_id"], student["canvas_course_id"]))
+        at_risk_flagged = prediction["at_risk_predicted"] if prediction else False
+        category, fired = categorize(student, click, at_risk_flagged)
         record = {
             "canvas_user_id": student["canvas_user_id"],
             "student_name": student["name"],
+            "nshe_id": student["integration_id"],
             "course_name": student["course_name"],
             "canvas_course_id": student["canvas_course_id"],
+            "section_number": student["section_number"],
             "category": category,
             "fired_rules": fired,
             "current_grade": float(student["current_score"]) if student["current_score"] else None,
+            "quiz_score": float(student["quiz_score"]) if student.get("quiz_score") is not None else None,
             "missing_assignments": int(student["missing_assignments"] or 0),
             "total_clicks": click["total_clicks"] if click else 0,
-            "breadth_z": click["breadth_z"] if click else None,
+            "click_coverage_z": click["breadth_z"] if click else None,
+            "click_intensity_z": click["intensity_z"] if click else None,
+            "click_coherence_z": click["coherence_z"] if click else None,
             "last_active": click["last_active"] if click else None,
         }
         records.append(record)
@@ -419,17 +576,17 @@ def run(
                 "fired_rules": fired,
             })
 
-        counts = Counter(r["category"] for r in records)
-        logger.info("--- Summary: %d students ---", len(records))
+    counts = Counter(r["category"] for r in records)
+    logger.info("--- Summary: %d students ---", len(records))
 
-        for cat in CATEGORY_ORDER:
-            logger.info("Category '%-50s %d", cat, counts.get(cat, 0))
-        
-        s3_csv = _upload(build_csv_bytes(records), s3_bucket, 
-                         f"{prefix}/alerts_{ts}.csv", "text/csv")
-        s3_excel = _upload(build_xlsx_bytes(records), s3_bucket, 
-                           f"{prefix}/alerts_{ts}.xlsx", 
-                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    for cat in CATEGORY_ORDER:
+        logger.info("Category '%-50s %d", cat, counts.get(cat, 0))
+    
+    s3_csv = _upload(build_csv_bytes(records), s3_bucket, 
+                        f"{prefix}/alerts_{ts}.csv", "text/csv")
+    s3_excel = _upload(build_xlsx_bytes(records), s3_bucket, 
+                        f"{prefix}/alerts_{ts}.xlsx", 
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     return {
         "total": len(records),
         "needs_agent": len(agent_queue),
