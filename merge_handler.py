@@ -174,7 +174,7 @@ def _merge(original_rows: list, agent_results: dict) -> list:
             resolved = agent_results.get(key)
             if resolved:
                 row = dict(row)  # create a copy to avoid mutating original
-                row["category"] = resolved
+                row["category"] = resolved["category"]
                 if "rationale" in resolved:
                     row["rationale"] = resolved.get("rationale")
                     row["category_no_ml"] = resolved.get("category_no_ml")
@@ -358,7 +358,7 @@ def lambda_handler(event, context):
         csv_bytes = buf.getvalue().encode("utf-8")
 
         s3_csv = _upload(csv_bytes, bucket, final_csv_key, "text/csv")
-        
+
         excel_builder = build_xlsx_bytes_research if mode == "research" else build_xlsx_bytes
         s3_excel = _upload(
             excel_builder(course_records), bucket, final_excel_key,
