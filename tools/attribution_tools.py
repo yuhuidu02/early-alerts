@@ -118,11 +118,11 @@ class AttributionToolkit:
                     ROUND(AVG(qsc.score), 2) AS avg_score
                 FROM quiz_submissions qs
                 JOIN quizzes qz ON qs.quiz_id = qz.id
-                JOIN question_scores qsc ON qsc.quiz_submission_id = qs.id
+                JOIN question_scores qsc ON qsc.submission_id = qs.id
                 JOIN questions q ON qsc.question_id = q.id
                 JOIN constructs c ON q.construct_id = c.id
                 WHERE qs.user_id = %s
-                  AND qs.course_id = %s
+                  AND qz.course_id = %s
                   AND qs.submitted_at IS NOT NULL
                   AND qs.submitted_at <= %s
                   AND c.code IN ('con', 'sth', 'mot', 'abur', 'res')
