@@ -299,7 +299,11 @@ def fetch_click_signals(timescale_cfg: dict, canvas_course_ids: list, as_of_date
 # --- Stage 1c. Fetch model predictions (mydb) ---
 def fetch_model_predictions(mydb_cfg: dict, canvas_course_ids: list, as_of_date: str) -> dict:
     """
-    Reads the latest at-risk prediction per (student, course) on or before as_of_date.
+    Reads the LATEST at-risk prediction per (student, course), regardless of when
+    it was made. as_of_date is accepted for call-site compatibility but no longer
+    used as a filter — predictions run hourly, and filtering to "<= as_of_date"
+    (a bare date, i.e. midnight) was silently excluding same-day predictions,
+    causing Chiron to act on stale data vs. what the dashboard shows.
     Returns dict keyed by (canvas_user_id, canvas_course_id).
     """
     ph = ",".join(["%s"] * len(canvas_course_ids))
@@ -313,10 +317,9 @@ def fetch_model_predictions(mydb_cfg: dict, canvas_course_ids: list, as_of_date:
         JOIN students s ON s.id = mp.student_id
         JOIN courses c  ON c.id = mp.course_id
         WHERE c.canvas_course_id IN ({ph})
-          AND mp.prediction_timestamp <= %s
         ORDER BY mp.student_id, c.canvas_course_id, mp.prediction_timestamp DESC
-    """, canvas_course_ids + [as_of_date])
-
+    """, canvas_course_ids)
+ 
     result = {
         (row["canvas_user_id"], row["canvas_course_id"]): {
             "at_risk_predicted": bool(row["at_risk_predicted"]),
@@ -324,7 +327,7 @@ def fetch_model_predictions(mydb_cfg: dict, canvas_course_ids: list, as_of_date:
         }
         for row in rows
     }
-    logger.info("Fetched %d model prediction rows for %d courses (as of %s)",
+    logger.info("Fetched %d latest model prediction rows for %d courses (run as_of_date=%s, not used as a filter)",
                 len(result), len(canvas_course_ids), as_of_date)
     return result
 
