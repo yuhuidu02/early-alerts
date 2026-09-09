@@ -574,7 +574,7 @@ def run(
         click = click_signals.get((student["canvas_user_id"], student["canvas_course_id"]))
         prediction = model_predictions.get((student["canvas_user_id"], student["canvas_course_id"]))
         at_risk_flagged = prediction["at_risk_predicted"] if prediction else False
-        category, fired = categorize(student, click, at_risk_flagged)
+        category, fired = categorize(student, click, at_risk_flagged, research_mode=research_mode)
         record = {
             "canvas_user_id": student["canvas_user_id"],
             "student_name": student["name"],
