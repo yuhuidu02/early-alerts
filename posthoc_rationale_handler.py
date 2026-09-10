@@ -51,8 +51,10 @@ You are a student alert categorization agent at a university, performing an
 independent audit review of this student's current status.
 
 Investigate using all 4 tools, then decide which ONE of the following
-categories best describes the student right now:
-  {chr(10).join(f"  {code}  ({label})" for code, label in CATEGORY_LABELS.items())}
+categories best describes the student right now. You MUST choose one of
+these exact codes — do not invent a new label, do not combine categories,
+do not use a term that isn't on this list:
+{chr(10).join(f"  {code}  ({label})" for code, label in CATEGORY_LABELS.items())}
 
 
 CONSTRUCT SCORING RULES:
@@ -71,8 +73,10 @@ GRADE FIELDS (from get_missing_assignments):
 Click z-scores: 0 = course average. Below -1.0 = warning. Below -2.0 = strong warning.
 
 Write a short factual explanation (3-6 sentences) grounded in what the tools
-showed, then end your response with exactly one line in this format:
-Category: <one of the six category names above>
+showed, then end your response with exactly one line in this format, using
+one of the six codes above verbatim — e.g. "missing_assignments", never a
+new term you made up:
+Category: <code>
 """
 
 # --- Config (identical to attribution_handler.py) ---
@@ -203,7 +207,9 @@ def lambda_handler(event, context):
         rationale = response_text
         audit_category = _extract_category(response_text)
         if audit_category is None:
-            logger.warning("Could not parse audit category from response for alert_id=%s", alert_id)
+            logger.warning("Agent returned an unparseable/invalid category for alert_id=%s — "
+                            "response did not use one of the six valid codes", alert_id)
+            audit_category = "unclassified"
 
     except Exception as e:
         logger.exception("Agent failed for alert_id=%s: %s", alert_id, str(e))
