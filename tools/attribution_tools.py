@@ -31,6 +31,7 @@ from typing import Any
 import psycopg2
 import psycopg2.extras
 from strands import tool
+from datetime import date, timedelta
 
 class AttributionToolkit:
     """
@@ -380,15 +381,33 @@ class AttributionToolkit:
                 {"week": str(r["week_start"])[:10], "clicks": r["click_count"]}
                 for r in weekly
             ]
+
+            # Flag the current (possibly still-in-progress) week so it's never
+            # silently compared to a full prior week.
+            as_of = date.fromisoformat(str(toolkit.as_of_date)[:10])
+            current_week_start = as_of - timedelta(days=as_of.weekday())
+            for w in weekly_data:
+                week_start_date = date.fromisoformat(w["week"])
+                if week_start_date == current_week_start:
+                    w["partial_week"] = True
+                    w["days_elapsed"] = (as_of - week_start_date).days + 1
+                else:
+                    w["partial_week"] = False
+
+            # Slope computed only between the two most recent COMPLETE weeks —
+            # a partial in-progress week is excluded, since it would always
+            # look like a decline regardless of actual behavior.
+            complete_weeks = [w for w in weekly_data if not w["partial_week"]]
             click_slope = (
-                weekly_data[-1]["clicks"] - weekly_data[-2]["clicks"]
-                if len(weekly_data) >= 2 else None
+                complete_weeks[-1]["clicks"] - complete_weeks[-2]["clicks"]
+                if len(complete_weeks) >= 2 else None
             )
             last_active_val = str(last_active_row[0]["last_active"]) if last_active_row else None
 
             return json.dumps({
                 "weekly_clicks": weekly_data,
                 "click_slope": click_slope,
+                "click_slope_note": "Computed between the two most recent COMPLETE weeks only. A week marked partial_week=true is excluded — don't compare its click count to a full week's.",
                 "last_active": str(last_active_val)[:10] if last_active_val else None,
                 "behavioral_features": {
                     "breadth": {
