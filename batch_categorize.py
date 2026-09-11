@@ -165,7 +165,7 @@ def fetch_click_signals(timescale_cfg: dict, canvas_course_ids: list, as_of_date
                 SELECT MAX(as_of_date)
                 FROM student_click_stats
                 WHERE course_id = scs.course_id
-                AND as_of_date <= %s
+                AND as_of_date <= (%s::date + interval '1 day')
             )
     """, canvas_course_ids + [as_of_date])
 
