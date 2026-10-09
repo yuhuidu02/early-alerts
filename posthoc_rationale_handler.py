@@ -46,6 +46,8 @@ CATEGORY_LABELS = {
 
 VALID_CATEGORIES = set(CATEGORY_LABELS.keys())
 
+_CODE_LIST = "\n".join(f"  {code}  ({label})" for code, label in CATEGORY_LABELS.items())
+
 SYSTEM_PROMPT = """
 You are a student alert categorization agent at a university, performing an
 independent audit review of this student's current status.
@@ -54,7 +56,7 @@ Investigate using all 4 tools, then decide which ONE of the following
 categories best describes the student right now. You MUST choose one of
 these exact codes — do not invent a new label, do not combine categories,
 do not use a term that isn't on this list:
-{chr(10).join(f"  {code}  ({label})" for code, label in CATEGORY_LABELS.items())}
+{_CODE_LIST}
 
 
 CONSTRUCT SCORING RULES:
