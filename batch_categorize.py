@@ -32,6 +32,7 @@ import boto3
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from realtime_predict import predict_roster # realtime ML
 import psycopg2
 import psycopg2.extras
 
@@ -65,45 +66,12 @@ def _query(cfg: dict, sql: str, params=None) -> list:
             cur.execute(sql, params)
             return [dict(row) for row in cur.fetchall()]
         
-# --- Stage 1a. Student roster (mydb) ---
 
-# def fetch_student_roster(mydb_cfg: dict, canvas_course_ids: list, as_of_date: str) -> list:
-#     """
-#     Fetches the most recent score snapshot per (student, course) on or before as_of_date.
-#     Uses student_score_snapshots instead of students table for historical accuracy.
-#     """
-#     ph = ",".join(["%s"] * len(canvas_course_ids))
-#     rows = _query(mydb_cfg, f"""
-#         SELECT DISTINCT ON (s.canvas_user_id, c.canvas_course_id)
-#             s.canvas_user_id,
-#             s.id            AS student_id,
-#             s.name,
-#             s.integration_id,
-#             ss.missing_assignments,
-#             ss.current_score,
-#             ss.quiz_score,
-#             sc.section_number,
-#             c.canvas_course_id,
-#             c.id              AS course_id,
-#             c.name            AS course_name
-#         FROM students s
-#         JOIN student_courses sc ON sc.student_id = s.id
-#         JOIN courses c          ON c.id = sc.course_id
-#         JOIN student_score_snapshots ss ON ss.student_id = s.id AND ss.course_id = c.id
-#         WHERE c.canvas_course_id IN ({ph})
-#             AND ss.recorded_at <= %s
-#             AND sc.status = 'active' 
-#         ORDER BY s.canvas_user_id, c.canvas_course_id, ss.recorded_at DESC
-#     """, canvas_course_ids + [as_of_date])
-#     logger.info("Roster: %d student-course rows across %d courses (as of %s)", 
-#                 len(rows), len(canvas_course_ids), as_of_date)
-#     return rows
 
 def fetch_student_roster(mydb_cfg: dict, canvas_course_ids: list, as_of_date: str) -> list:
     """
-    Fetches the latest score snapshot per (student, course), regardless of when
-    Chiron is run. current_score always reflects the most recent data available.
-    Uses student_score_snapshots instead of students table for historical accuracy.
+    Fetches the latest score snapshot per (student, course) up to the end of as_of_date
+    (inclusive of same-day snapshots).
     """
     ph = ",".join(["%s"] * len(canvas_course_ids))
     rows = _query(mydb_cfg, f"""
@@ -124,9 +92,10 @@ def fetch_student_roster(mydb_cfg: dict, canvas_course_ids: list, as_of_date: st
         JOIN courses c          ON c.id = sc.course_id
         JOIN student_score_snapshots ss ON ss.student_id = s.id AND ss.course_id = c.id
         WHERE c.canvas_course_id IN ({ph})
+            AND ss.recorded_at < (%s::date + 1)
             AND sc.status = 'active' 
         ORDER BY s.canvas_user_id, c.canvas_course_id, ss.recorded_at DESC
-    """, canvas_course_ids)
+    """, canvas_course_ids + [as_of_date])
     logger.info("Roster: %d student-course rows across %d courses (latest snapshot, requested as_of_date=%s)", 
                 len(rows), len(canvas_course_ids), as_of_date)
     return rows
@@ -165,7 +134,7 @@ def fetch_click_signals(timescale_cfg: dict, canvas_course_ids: list, as_of_date
                 SELECT MAX(as_of_date)
                 FROM student_click_stats
                 WHERE course_id = scs.course_id
-                AND as_of_date <= (%s::date + interval '1 day')
+                AND as_of_date <= %s::date
             )
     """, canvas_course_ids + [as_of_date])
 
@@ -202,100 +171,6 @@ def fetch_click_signals(timescale_cfg: dict, canvas_course_ids: list, as_of_date
     return result
 
 
-
-# def fetch_click_signals(timescale_cfg: dict, canvas_course_ids: list, as_of_date: str) -> dict:
-#     """
-#     Returns dict keyed by (canvas_user_id, canvas_course_id).
-#     All click data filtered to timestamp <= as_of_date.
-#     Z-scores computed against the course population up to that same date
-#     for a true historical snapshot.
-#     """
-#     ph = ",".join(["%s"] * len(canvas_course_ids))
-
-#     course_map = {
-#         r["canvas_course_id"]: r["id"]
-#         for r in _query(timescale_cfg,
-#                         f"SELECT canvas_course_id, id FROM courses WHERE canvas_course_id IN ({ph})",
-#                         canvas_course_ids)
-#     }
-#     if not course_map:
-#         logger.warning("No matching courses found in timescale for canvas_course_ids: %s", canvas_course_ids)
-#         return {}
-    
-#     ts_course_ids = list(course_map.values())
-#     ph2 = ",".join(["%s"] * len(ts_course_ids))
-
-#     student_map = {
-#         r["canvas_user_id"]: r["id"]
-#         for r in _query(timescale_cfg, f"""
-#             SELECT DISTINCT s.canvas_user_id, s.id
-#             FROM students s
-#             JOIN click_sequences cs ON cs.user_id = s.id
-#             WHERE cs.course_id IN ({ph2})
-#             AND cs.timestamp <= %s
-#         """, ts_course_ids + [as_of_date])
-#     }
-
-#     logger.info("Fetching all click events up to %s for %d courses...", as_of_date, len(ts_course_ids))
-
-#     all_clicks = _query(timescale_cfg, f"""
-#         SELECT user_id, course_id, label, timestamp
-#         FROM click_sequences
-#         WHERE course_id IN ({ph2})
-#             AND timestamp <= %s
-#         ORDER BY user_id, course_id, timestamp ASC
-#     """, ts_course_ids + [as_of_date])
-#     logger.info("Fetched %d click events", len(all_clicks))
-
-#     sequences:     dict = defaultdict(list)
-#     last_active:   dict = {}
-#     weekly_counts: dict = defaultdict(lambda: defaultdict(int)) # (user_id, course_id) -> week -> count
-
-#     for row in all_clicks:
-#         key = (row["user_id"], row["course_id"])
-#         sequences[key].append(row["label"])
-#         ts = row["timestamp"]
-#         if key not in last_active or ts > last_active[key]:
-#             last_active[key] = ts
-#         weekly_counts[key][ts.strftime("%Y-W%W")] += 1
-    
-#     course_breadths: dict = defaultdict(list)
-#     student_breadth: dict = {}
-
-#     for (uid, cid), seq in sequences.items():
-#         breadth = len(set(seq))
-#         course_breadths[cid].append(breadth)
-#         student_breadth[(uid, cid)] = breadth
-
-#     def z_score(value, population):
-#         if len(population) < 2:
-#             return 0.0
-#         std = statistics.stdev(population)
-#         return 0.0 if std == 0 else round((value - statistics.mean(population)) / std, 2)
-    
-#     rev_student = {v: k for k, v in student_map.items()}
-#     rev_course  = {v: k for k, v in course_map.items()}
-
-#     result = {}
-
-#     for (uid, cid), breadth in student_breadth.items():
-#         canvas_uid = rev_student.get(uid)
-#         canvas_cid = rev_course.get(cid)
-#         if canvas_uid is None or canvas_cid is None:
-#             continue
-#         wk_vals = sorted(weekly_counts[(uid, cid)].values())
-#         la = last_active.get((uid, cid))
-#         result[(canvas_uid, canvas_cid)] = {
-#             "total_clicks": sum(wk_vals),
-#             "click_slope": (wk_vals[-1] - wk_vals[-2]) if len(wk_vals) >= 2 else 0,
-#             "last_active": str(la)[:10] if la else None,
-#             "breadth": breadth,
-#             "breadth_z": z_score(breadth, course_breadths[cid])
-#         }
-#     logger.info("Processed click signals for %d student-course pairs", len(result))
-#     return result
-
-
 # --- Stage 1c. Fetch model predictions (mydb) ---
 def fetch_model_predictions(mydb_cfg: dict, canvas_course_ids: list, as_of_date: str) -> dict:
     """
@@ -317,8 +192,9 @@ def fetch_model_predictions(mydb_cfg: dict, canvas_course_ids: list, as_of_date:
         JOIN students s ON s.id = mp.student_id
         JOIN courses c  ON c.id = mp.course_id
         WHERE c.canvas_course_id IN ({ph})
+          AND mp.prediction_timestamp < (%s::date + 1)
         ORDER BY mp.student_id, c.canvas_course_id, mp.prediction_timestamp DESC
-    """, canvas_course_ids)
+    """, canvas_course_ids + [as_of_date])
  
     result = {
         (row["canvas_user_id"], row["canvas_course_id"]): {
@@ -338,11 +214,16 @@ def fetch_model_predictions(mydb_cfg: dict, canvas_course_ids: list, as_of_date:
 # Fixed/deterministic for now; RL-tuned later.
 
 THRESHOLDS = {
-    "default": {"low_engagement_z": -1.5, "low_engagement_min_dims": 2, "quiz_score_cutoff": 70.0, "missing_cutoff": 2},  # placeholder — tune me
-    "flagged": {"low_engagement_z": -1.0, "low_engagement_min_dims": 2, "quiz_score_cutoff": 75.0, "missing_cutoff": 1},  # placeholder — tune me
+    "default": {"low_engagement_z": -1.5, "low_engagement_min_dims": 2, "missing_cutoff": 2},  # placeholder — tune me
+    "flagged": {"low_engagement_z": -1.0, "low_engagement_min_dims": 2, "missing_cutoff": 1},  # placeholder — tune me
 }
 
-def get_fired_rules(student: dict, click: dict | None, at_risk_flagged: bool = False) -> list:
+# Instructor-set grade cutoffs (current course grade, 0-100). Overridable per run.
+DEFAULT_EXCEPTIONAL_CUTOFF = 85.0   # >= this (and no rules fired) -> Exceptional
+DEFAULT_SATISFACTORY_FLOOR = 70.0   # <  this -> Exam/Quiz Performance fires
+
+def get_fired_rules(student: dict, click: dict | None, at_risk_flagged: bool = False,
+                    satisfactory_floor: float = DEFAULT_SATISFACTORY_FLOOR) -> list:
     """
     Evaluate all rules and returns every category whose conditions are met.
 
@@ -353,8 +234,9 @@ def get_fired_rules(student: dict, click: dict | None, at_risk_flagged: bool = F
     """
     t = THRESHOLDS["flagged"] if at_risk_flagged else THRESHOLDS["default"]
 
-    grade = float(student["current_score"] or 0)
-    quiz_score = float(student["quiz_score"]) if student["quiz_score"] is not None else None
+    # grade = float(student["current_score"] or 0)
+    grade = float(student["current_score"]) if student["current_score"] is not None else None
+    # quiz_score = float(student["quiz_score"]) if student["quiz_score"] is not None else None
     missing = int(student["missing_assignments"] or 0)
     bz = click["breadth_z"] if click else 0
     iz = click["intensity_z"] if click else 0
@@ -373,7 +255,12 @@ def get_fired_rules(student: dict, click: dict | None, at_risk_flagged: bool = F
     if low_dimensions >= t["low_engagement_min_dims"]:
         fired.append(CAT_LOW_ENGAGEMENT)
 
-    if quiz_score is not None and quiz_score < t["quiz_score_cutoff"]:
+    # if quiz_score is not None and quiz_score < t["quiz_score_cutoff"]:
+    #     fired.append(CAT_EXAM_PERFORMANCE)
+    # edits on 100926 - Canvas doesn't reliably tell us which assignments are quizzes/exams,
+    # so this fires on overall current grade below the instructor's satisfactory cutoff.
+    # No grade yet (NULL) does not fire.
+    if grade is not None and grade < satisfactory_floor:
         fired.append(CAT_EXAM_PERFORMANCE)
     
     return fired
@@ -381,7 +268,10 @@ def get_fired_rules(student: dict, click: dict | None, at_risk_flagged: bool = F
 # The three "investigable" negative categories - only these trigger the agent
 INVESTIGABLE = [CAT_MISSING_ASSIGNMENTS, CAT_LOW_ENGAGEMENT, CAT_EXAM_PERFORMANCE]
 
-def categorize(student: dict, click: dict | None, at_risk_flagged: bool = False, research_mode: bool = False) -> str:
+def categorize(student: dict, click: dict | None, at_risk_flagged: bool = False, 
+               research_mode: bool = False,
+               exceptional_cutoff: float = DEFAULT_EXCEPTIONAL_CUTOFF,
+               satisfactory_floor: float = DEFAULT_SATISFACTORY_FLOOR) -> str:
     """
     Returns (final category, all fired rules).
 
@@ -399,7 +289,7 @@ def categorize(student: dict, click: dict | None, at_risk_flagged: bool = False,
     in research_mode.
     """
 
-    fired = get_fired_rules(student, click, at_risk_flagged)
+    fired = get_fired_rules(student, click, at_risk_flagged, satisfactory_floor=satisfactory_floor)
     grade = float(student["current_score"] or 0)
 
     # Never attended is always top priority if it fires
@@ -409,7 +299,7 @@ def categorize(student: dict, click: dict | None, at_risk_flagged: bool = False,
     if len(fired) == 0:
         if research_mode and at_risk_flagged:
             return CAT_NEEDS_AGENT, fired # ML says at-risk but no deterministic rules fired # added 090826
-        category = CAT_POSITIVE_EXCEPTIONAL if grade >= 85.0 else CAT_POSITIVE_SATISFACTORY
+        category = CAT_POSITIVE_EXCEPTIONAL if grade >= exceptional_cutoff else CAT_POSITIVE_SATISFACTORY
         return category, fired
     
     # count how many of the investigable negatives fired
@@ -539,7 +429,10 @@ def run(
     canvas_course_ids: list,
     s3_bucket: str,
     as_of_date: str,  # e.g., "2026-03-12"
-    research_mode: bool = False
+    research_mode: bool = False,
+    use_realtime_predictions: bool = False,
+    exceptional_cutoff: float = DEFAULT_EXCEPTIONAL_CUTOFF,
+    satisfactory_floor: float = DEFAULT_SATISFACTORY_FLOOR,
 ) -> dict:
     """
     Returns:
@@ -566,6 +459,9 @@ def run(
     roster = fetch_student_roster(mydb_cfg, canvas_course_ids, as_of_date)
     click_signals = fetch_click_signals(timescale_cfg, canvas_course_ids, as_of_date)
     model_predictions = fetch_model_predictions(mydb_cfg, canvas_course_ids, as_of_date)
+    if use_realtime_predictions:
+        # Realtime results win; DB rows remain the fallback for any failed invoke
+        model_predictions.update(predict_roster(roster, ts))
 
     records = []
     agent_queue = []
@@ -574,7 +470,10 @@ def run(
         click = click_signals.get((student["canvas_user_id"], student["canvas_course_id"]))
         prediction = model_predictions.get((student["canvas_user_id"], student["canvas_course_id"]))
         at_risk_flagged = prediction["at_risk_predicted"] if prediction else False
-        category, fired = categorize(student, click, at_risk_flagged, research_mode=research_mode)
+        category, fired = categorize(student, click, at_risk_flagged, 
+                                     research_mode=research_mode,
+                                     exceptional_cutoff=exceptional_cutoff,
+                                     satisfactory_floor=satisfactory_floor)
         record = {
             "canvas_user_id": student["canvas_user_id"],
             "student_name": student["name"],
@@ -584,7 +483,7 @@ def run(
             "section_number": student["section_number"],
             "category": category,
             "fired_rules": fired,
-            "current_grade": float(student["current_score"]) if student["current_score"] else None,
+            "current_grade": float(student["current_score"]) if student["current_score"] is not None else None,
             "quiz_score": float(student["quiz_score"]) if student.get("quiz_score") is not None else None,
             "missing_assignments": int(student["missing_assignments"] or 0),
             "total_clicks": click["total_clicks"] if click else 0,
@@ -610,7 +509,8 @@ def run(
                 # condition must never see a fired_rules list that was itself already
                 # influenced by the ML flag via THRESHOLDS["flagged"]. Only relevant when
                 # at_risk_flagged was actually True; otherwise this is identical to `fired`
-                entry["fired_rules_no_ml"] = get_fired_rules(student, click, at_risk_flagged=False)
+                entry["fired_rules_no_ml"] = get_fired_rules(student, click, at_risk_flagged=False,
+                                                             satisfactory_floor=satisfactory_floor)
             agent_queue.append(entry)
 
     counts = Counter(r["category"] for r in records)
@@ -634,5 +534,8 @@ def run(
         "s3_csv": s3_csv,
         "s3_excel": s3_excel,
         "research_mode": research_mode,
+        "use_realtime_predictions": use_realtime_predictions,
+        "exceptional_cutoff": exceptional_cutoff,
+        "satisfactory_floor": satisfactory_floor,
     }
 

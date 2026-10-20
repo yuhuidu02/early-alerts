@@ -125,7 +125,7 @@ class AttributionToolkit:
                 WHERE qs.user_id = %s
                   AND qz.course_id = %s
                   AND qs.submitted_at IS NOT NULL
-                  AND qs.submitted_at <= %s
+                  AND qs.submitted_at < (%s::date + 1)
                   AND c.code IN ('con', 'sth', 'mot', 'abur', 'res')
                 GROUP BY qs.submitted_at, qz.title, c.code, c.name
                 ORDER BY qs.submitted_at ASC, c.code
@@ -179,19 +179,20 @@ class AttributionToolkit:
         toolkit = self
 
         @tool
-        def get_missing_assignments(student_id: int) -> str:
+        def get_missing_assignments(student_id: int, course_id: int) -> str:
             """
-            Retrieves the full snapshot history of a student's missing assignment count
-            and quiz score (Chiron survey performance) up to as_of_date, ordered oldest
+            Retrieves the full snapshot history of a student's current course grade, 
+            missing assignment count and quiz score in one course up to as_of_date, ordered oldest
             to newest. Use the trend — not just the latest value — to assess whether
             the issue is worsening, improving, or chronic.
  
             Args:
                 student_id (int): The student's internal mydb id.
+                course_id (int): The course's internal mydb id.
  
             Returns:
                 str: JSON with student name, latest values, and full weekly history
-                     of missing_assignments and quiz_score.
+                     of current_grade, missing_assignments and quiz_score.
             """
             rows = toolkit._query_mydb("""
                 SELECT
@@ -203,9 +204,10 @@ class AttributionToolkit:
                 FROM students s
                 JOIN student_score_snapshots ss ON ss.student_id = s.id
                 WHERE s.id = %s
-                  AND ss.recorded_at <= %s
+                  AND ss.course_id = %s
+                  AND ss.recorded_at < (%s::date + 1)
                 ORDER BY ss.recorded_at ASC
-            """, (student_id, toolkit.as_of_date))
+            """, (student_id, course_id, toolkit.as_of_date))
 
             if not rows:
                 return json.dumps({"error": "Student not found"})
@@ -213,13 +215,14 @@ class AttributionToolkit:
             history = [
                 {
                     "recorded_at": str(row["recorded_at"])[:10],
+                    "current_grade": float(row["current_score"]) if row["current_score"] is not None else None,
                     "missing_assignments": row["missing_assignments"],
                     "quiz_score": float(row["quiz_score"]) if row["quiz_score"] is not None else None,
                 }
                 for row in rows
             ]
  
-            latest = rows[-1]  # oldest record is last due to DESC order
+            latest = rows[-1]  # ASC order, so last row is the most recent
             return json.dumps({
                 "student_name":        latest["name"],
                 "latest_missing_assignments": latest["missing_assignments"],
@@ -260,7 +263,7 @@ class AttributionToolkit:
                 WHERE qs.user_id = %s
                   AND qz.course_id = %s
                   AND qs.submitted_at IS NOT NULL
-                  AND qs.submitted_at <= %s
+                  AND qs.submitted_at < (%s::date + 1)
                   AND q.code IN ('with_v2', 'supp')
                 ORDER BY qs.submitted_at ASC, q.code
             """, (student_id, course_id, toolkit.as_of_date))
@@ -319,7 +322,7 @@ class AttributionToolkit:
             weekly = toolkit._query_timescale("""
                 SELECT DATE_TRUNC('week', timestamp) AS week_start, COUNT(*) AS click_count
                 FROM click_sequences
-                WHERE user_id = %s AND course_id = %s AND timestamp <= %s
+                WHERE user_id = %s AND course_id = %s AND timestamp < (%s::date + 1)
                 GROUP BY week_start
                 ORDER BY week_start ASC
             """, (click_student_id, click_course_id, toolkit.as_of_date))
@@ -327,12 +330,12 @@ class AttributionToolkit:
             last_active_row = toolkit._query_timescale("""
                 SELECT MAX(timestamp) AS last_active
                 FROM click_sequences
-                WHERE user_id = %s AND course_id = %s AND timestamp <= %s
+                WHERE user_id = %s AND course_id = %s AND timestamp < (%s::date + 1)
             """, (click_student_id, click_course_id, toolkit.as_of_date))
 
             sequence_rows = toolkit._query_timescale("""
                 SELECT label FROM click_sequences
-                WHERE user_id = %s AND course_id = %s AND timestamp <= %s
+                WHERE user_id = %s AND course_id = %s AND timestamp < (%s::date + 1)
                 ORDER BY timestamp ASC
             """, (click_student_id, click_course_id, toolkit.as_of_date))
 
@@ -362,14 +365,14 @@ class AttributionToolkit:
 
             all_students = toolkit._query_timescale("""
                 SELECT DISTINCT user_id FROM click_sequences
-                WHERE course_id = %s AND timestamp <= %s
+                WHERE course_id = %s AND timestamp < (%s::date + 1)
             """, (click_course_id, toolkit.as_of_date))
 
             all_breadths, all_depths = [], []
             for row in all_students:
                 rows = toolkit._query_timescale("""
                     SELECT label FROM click_sequences
-                    WHERE user_id = %s AND course_id = %s AND timestamp <= %s
+                    WHERE user_id = %s AND course_id = %s AND timestamp < (%s::date + 1)
                     ORDER BY timestamp ASC
                 """, (row["user_id"], click_course_id, toolkit.as_of_date))
                 if rows:

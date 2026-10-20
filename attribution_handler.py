@@ -70,14 +70,14 @@ CONSTRUCT SCORING RULES:
 - res (Resilience):   1-6, LOWER means LESS resilient.
 
 GRADE FIELDS (from get_missing_assignments):
-- latest_current_grade: the student's overall course grade (0-100). Provided for context only —
-  it does NOT trigger any alert category on its own.
-- latest_quiz_score: the student's most recent Chiron quiz score (0-100). This is the
-  SOLE trigger for Neg: Exam/Quiz Performance. Below 60 = poor quiz performance.
+- latest_current_grade: the student's overall course grade (0-100). This is the SOLE trigger
+  for Neg: Exam/Quiz Performance, which fires when the grade is below the instructor's
+  satisfactory cutoff. Treat that category as "poor overall grade".
+- latest_quiz_score: the student's most recent Chiron quiz score (0-100). Context only.
 - latest_missing_assignments: the student's most recent missing assignment count.
-- history: full weekly snapshot of missing_assignments and quiz_score ordered oldest to newest.
-  Use the trend to distinguish chronic issues from sudden drops or improving trajectories —
-  this context is key when choosing the root cause category.
+- history: full weekly snapshot of current_grade, missing_assignments and quiz_score ordered
+  oldest to newest. Use the trend to distinguish chronic issues from sudden drops or improving
+  trajectories — this context is key when choosing the root cause category.
   
 Click z-scores: 0 = course average. Below -1.0 = warning. Below -2.0 = strong warning.
 """
@@ -92,6 +92,15 @@ VALID_CATEGORIES = [
     CAT_POSITIVE_SATISFACTORY,
 ]
 
+# new helper, after VALID_CATEGORIES
+def _thresholds_text(exceptional_cutoff, satisfactory_floor) -> str:
+    if exceptional_cutoff is None or satisfactory_floor is None:
+        return ""
+    return (f"Instructor grade cutoffs (current course grade):\n"
+            f"      - Exceptional: >= {exceptional_cutoff}%\n"
+            f"      - Satisfactory: >= {satisfactory_floor}% and < {exceptional_cutoff}%\n"
+            f"      - Below {satisfactory_floor}%: failing (Neg: Exam/Quiz Performance fires)\n")
+
 SYSTEM_PROMPT_RESEARCH = """
 You are a student alert categorization agent at a university, running in RESEARCH MODE.
  
@@ -105,10 +114,13 @@ CATEGORIES (choose exactly one):
 - "Neg: Missing Assignment(s)" — one or more missing assignments is the primary issue.
 - "Neg: Lack of Engagement or Infrequent Attendance" — activity is present but sparse, shallow,
   or infrequent relative to peers (low click breadth/intensity/coherence).
-- "Neg: Exam/Quiz Performance" — the primary issue is poor quiz/exam scores, not attendance or engagement.
-- "Positive: Satisfactory Course Performance" — no significant negative signal; performing adequately.
-- "Positive: Exceptional Course Performance" — no significant negative signal; performing strongly
-  (current course grade around 85% or higher is a good rule of thumb, but use overall judgment).
+- "Neg: Exam/Quiz Performance" — the primary issue is a poor overall course grade (below the instructor's satisfactory cutoff), not attendance or engagement.
+- "Positive: Satisfactory Course Performance" — no significant negative signal; current course grade
+  at or above the instructor's Satisfactory cutoff and below their Exceptional cutoff.
+- "Positive: Exceptional Course Performance" — no significant negative signal; current course grade
+  at or above the instructor's Exceptional cutoff.
+The instructor's cutoffs are given in the student prompt. A student below the Satisfactory cutoff
+is failing in the instructor's view and should NOT be given a Positive category.
  
 You will also be told which categories the deterministic rule engine flagged for this student
 ("fired_rules"). Treat this as CONTEXT ONLY, not a constraint — you may agree with it, pick a
@@ -128,11 +140,11 @@ CONSTRUCT SCORING RULES:
 - res (Resilience):   1-6, LOWER means LESS resilient.
  
 GRADE FIELDS (from get_missing_assignments):
-- latest_current_grade: the student's overall course grade (0-100). Context only.
-- latest_quiz_score: the student's most recent Chiron quiz score (0-100).
+- latest_current_grade: the student's overall course grade (0-100). Compare against the instructor's cutoffs.
+- latest_quiz_score: the student's most recent quiz score (0-100). Context only.
 - latest_missing_assignments: the student's most recent missing assignment count.
-- history: full weekly snapshot ordered oldest to newest. Use the trend to distinguish
-  chronic issues from sudden drops or improving trajectories.
+- history: full weekly snapshot of current_grade, missing_assignments and quiz_score, ordered
+  oldest to newest. Use the trend to distinguish chronic issues from sudden drops or improving trajectories.
  
 Click z-scores: 0 = course average. Below -1.0 = warning. Below -2.0 = strong warning.
  
@@ -232,7 +244,7 @@ def _parse_agent_output_research(response_text: str, fired_rules: list) -> tuple
     return default_category, f"[Agent output unparseable — defaulted. Raw output: {response_text[:500]}]"
  
 def _build_prompt_research(student: dict, fired_rules: list, as_of_date: str, ids: dict,
-                           ml_prediction: dict | None) -> str:
+                           ml_prediction: dict | None, thresholds_text: str = "") -> str:
     fired_text = ", ".join(fired_rules) if fired_rules else "(none — no deterministic rule fired)"
  
     ml_block = ""
@@ -249,7 +261,8 @@ def _build_prompt_research(student: dict, fired_rules: list, as_of_date: str, id
       Student Name: {student['name']}
       Course: {student['course_name']}
       As of Date: {as_of_date}
- 
+    
+      {thresholds_text}
       Deterministic rule engine flagged (context only, not a constraint): {fired_text}
       {ml_block}
       Internal IDs for tool calls:
@@ -263,13 +276,13 @@ def _build_prompt_research(student: dict, fired_rules: list, as_of_date: str, id
 
 def _run_agent_condition(toolkit: AttributionToolkit, model: BedrockModel, student: dict,
                           fired_rules: list, as_of_date: str, ids: dict,
-                          ml_prediction: dict | None) -> tuple:
+                          ml_prediction: dict | None, thresholds_text: str = "") -> tuple:
     """
     Runs one independent agent instance for one condition (AI-only or AI+ML).
     No shared state between conditions — a fresh Agent() each call.
     """
     agent = Agent(model=model, tools=toolkit.all(), system_prompt=SYSTEM_PROMPT_RESEARCH)
-    prompt = _build_prompt_research(student, fired_rules, as_of_date, ids, ml_prediction)
+    prompt = _build_prompt_research(student, fired_rules, as_of_date, ids, ml_prediction, thresholds_text=thresholds_text)
     try:
         response = agent(prompt)
         return _parse_agent_output_research(str(response), fired_rules)
@@ -332,6 +345,9 @@ def lambda_handler(event, context):
     fired_rules_no_ml = event.get("fired_rules_no_ml")
     at_risk_predicted = event.get("at_risk_predicted")
     at_risk_probability = event.get("at_risk_probability")
+    exceptional_cutoff = event.get("exceptional_cutoff")
+    satisfactory_floor = event.get("satisfactory_floor")
+    thresholds_text = _thresholds_text(exceptional_cutoff, satisfactory_floor)
     
     logger.info("Attribution for canvas_user_id=%s canvas_course_id=%s as_of=%s fired=%s",
             canvas_user_id, canvas_course_id, as_of_date, fired_rules)
@@ -392,14 +408,16 @@ def lambda_handler(event, context):
             if at_risk_predicted is not None:
                 ml_prediction = {"at_risk_predicted": at_risk_predicted, "at_risk_probability": at_risk_probability}
             category, rationale = _run_agent_condition(
-                toolkit, model, student, fired_rules, as_of_date, ids, ml_prediction=ml_prediction
+                toolkit, model, student, fired_rules, as_of_date, ids, 
+                ml_prediction=ml_prediction, thresholds_text=thresholds_text
             )
  
             # AI-only — comparison. Uses fired_rules_no_ml (unadjusted thresholds) + no ML info,
             # so nothing ML-derived leaks into this condition, not even indirectly via thresholds.
             fired_no_ml = fired_rules_no_ml if fired_rules_no_ml is not None else fired_rules
             category_no_ml, rationale_no_ml = _run_agent_condition(
-                toolkit, model, student, fired_no_ml, as_of_date, ids, ml_prediction=None
+                toolkit, model, student, fired_no_ml, as_of_date, ids, 
+                ml_prediction=None, thresholds_text=thresholds_text
             )
  
             logger.info("Agent resolved (research): %s -> AI+ML=%s | AI-only=%s",
@@ -439,6 +457,7 @@ def lambda_handler(event, context):
             Course: {student['course_name']}
             As of Date: {as_of_date}
 
+            {thresholds_text}
             The following categories all fired for this student as of {as_of_date}:
             {json.dumps(fired_rules, indent=2)}
             
@@ -463,7 +482,6 @@ def lambda_handler(event, context):
             if category is None:
                 category = fired_rules[0]
                 logger.warning("Agent failed to pick category from list, defaulting to first one: %s", category)
-                category = fired_rules[0]
             
             logger.info("Agent resolved: %s -> %s", student["name"], category)
         

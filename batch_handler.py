@@ -116,7 +116,9 @@ def _write_manifest(
     return key
 
 # --- Agent fan-out helpers ---
-def _invoke_attribution(student: dict, manifest_key: str, bucket: str, as_of_date: str, mode: str = "production") -> None:
+def _invoke_attribution(student: dict, manifest_key: str, bucket: str, as_of_date: str,
+                        mode: str = "production",
+                        exceptional_cutoff: float = None, satisfactory_floor: float = None) -> None:
     boto3.client("lambda", region_name=os.environ["AWS_DEFAULT_REGION"]).invoke(
         FunctionName = os.environ["ATTRIBUTION_FUNCTION_NAME"],
         InvocationType = "Event",
@@ -128,6 +130,8 @@ def _invoke_attribution(student: dict, manifest_key: str, bucket: str, as_of_dat
             "at_risk_predicted": student.get("at_risk_predicted"),
             "at_risk_probability": student.get("at_risk_probability"),
             "mode": mode,
+            "exceptional_cutoff": exceptional_cutoff,
+            "satisfactory_floor": satisfactory_floor,
             "manifest_key": manifest_key,
             "s3_bucket": bucket,
             "as_of_date": as_of_date,
@@ -154,10 +158,17 @@ def lambda_handler(event, context):
         canvas_course_ids = body.get("canvas_course_ids") if body else None
         as_of_date = body.get("as_of_date") if body else None
         run_id = body.get("run_id") if body else None
+        exceptional_cutoff = body.get("exceptional_cutoff") if body else None
+        satisfactory_floor = body.get("satisfactory_floor") if body else None
     except Exception:
         canvas_course_ids = None
         as_of_date = None
         run_id = None
+        exceptional_cutoff = None
+        satisfactory_floor = None
+
+    exceptional_cutoff = float(exceptional_cutoff) if exceptional_cutoff is not None else batch_categorize.DEFAULT_EXCEPTIONAL_CUTOFF
+    satisfactory_floor = float(satisfactory_floor) if satisfactory_floor is not None else batch_categorize.DEFAULT_SATISFACTORY_FLOOR
 
     # Default as_of_date to today if not supplied
     if not as_of_date:
@@ -193,6 +204,8 @@ def lambda_handler(event, context):
             s3_bucket=bucket,
             as_of_date=as_of_date,
             research_mode=(CHIRON_MODE == "research"),
+            exceptional_cutoff=exceptional_cutoff,
+            satisfactory_floor=satisfactory_floor,
         )
     except Exception as e:
         logger.exception("Batch job failed: %s", e)
@@ -218,7 +231,9 @@ def lambda_handler(event, context):
     if agent_queue:
         for student in agent_queue:
             try:
-                _invoke_attribution(student, manifest_key, bucket, as_of_date, mode=CHIRON_MODE)
+                _invoke_attribution(student, manifest_key, bucket, as_of_date, mode=CHIRON_MODE,
+                                    exceptional_cutoff=exceptional_cutoff,
+                                    satisfactory_floor=satisfactory_floor)
                 agent_launched += 1
             except Exception as e:
                 logger.error("Failed to invoke attribution for student %d in course %d: %s", 
