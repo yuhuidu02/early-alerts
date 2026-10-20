@@ -34,6 +34,7 @@ import psycopg2.extras
 import batch_categorize
 
 CHIRON_MODE = os.environ.get("CHIRON_MODE", "production")
+USE_REALTIME_PREDICTIONS = os.environ.get("USE_REALTIME_PREDICTIONS", "false").lower() == "true"
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -204,6 +205,9 @@ def lambda_handler(event, context):
             s3_bucket=bucket,
             as_of_date=as_of_date,
             research_mode=(CHIRON_MODE == "research"),
+            # realtime features are "as of now", so only valid for today's runs
+            use_realtime_predictions=(USE_REALTIME_PREDICTIONS
+                                      and as_of_date == datetime.utcnow().strftime("%Y-%m-%d")),
             exceptional_cutoff=exceptional_cutoff,
             satisfactory_floor=satisfactory_floor,
         )
